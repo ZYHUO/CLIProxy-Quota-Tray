@@ -161,10 +161,8 @@
           saveSettings: async (s) => s,
           clearUsage: async () => snapshot,
           enableUsage: async () => snapshot,
-          getServerInfo: async () => ({ port: 0 }),
           hideWindow: async () => {},
           setPinned: async (p) => (pinned = p),
-          openExternal: async () => {},
           onPinChange: () => () => {}
         };
 

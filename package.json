@@ -1,8 +1,11 @@
 {
   "name": "cliproxy-quota-tray",
   "productName": "CLIProxy Quota Tray",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Windows tray dashboard for CLIProxyAPI OAuth quota, usage cost and provider status",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "type": "module",
   "main": "electron/main.cjs",
   "license": "MIT",
@@ -10,9 +13,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "electron": "electron . --dist",
+    "test": "node --test tests/*.test.cjs",
+    "electron": "vite build && electron . --dist",
     "preview:fake": "vite build && node scripts/serve-preview.mjs",
-    "package:win": "vite build && electron-packager . \"CLIProxy Quota Tray\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/(src|tools|docs|scripts|release|node_modules|\\.git|\\.github)($|/)\" --ignore=\"^/(vite\\.config\\.js|index\\.html|\\.gitignore|README\\.md|AGENT\\.md|LICENSE)$\""
+    "package:win": "vite build && electron-packager . \"CLIProxy Quota Tray\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/(src|tools|docs|scripts|tests|release|node_modules|\\.git|\\.github)($|/)\" --ignore=\"^/(vite\\.config\\.js|index\\.html|\\.gitignore|README\\.md|AGENT\\.md)$\""
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
@@ -20,9 +24,9 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@electron/packager": "^18.3.6",
+    "@electron/packager": "^20.0.2",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "38.4.0",
+    "electron": "43.1.1",
     "vite": "^6.0.5"
   }
 }

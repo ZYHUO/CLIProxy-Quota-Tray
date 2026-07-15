@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Bot,
@@ -118,6 +118,28 @@ function normalizeProvider(value = "") {
         : raw.includes("grok") || raw.includes("xai") || raw.includes("x.ai")
           ? "xai"
           : "misc";
+}
+
+function isInsecureRemoteManagementUrl(value) {
+  let input = String(value || "").trim();
+  if (!input) return false;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) input = `http://${input}`;
+  try {
+    const url = new URL(input);
+    if (url.protocol !== "http:") return false;
+    const hostname = url.hostname.toLowerCase();
+    return !(
+      hostname === "localhost"
+      || hostname.endsWith(".localhost")
+      || hostname === "127.0.0.1"
+      || hostname.startsWith("127.")
+      || hostname === "0.0.0.0"
+      || hostname === "[::1]"
+      || hostname === "::1"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function toNumber(value, fallback = 0) {
@@ -241,7 +263,9 @@ function authName(auth) {
     auth.name ||
     auth.file ||
     auth.path ||
-    `oauth ${auth.authIndex ?? ""}`.trim() ||
+    auth.id ||
+    auth.authIndex ||
+    auth.auth_index ||
     "oauth account"
   );
 }
@@ -488,20 +512,21 @@ function buildDashboard(snapshot) {
   const settings = snapshot.settings || {};
   const quotas = { ...DEFAULT_QUOTAS, ...(settings.quotas || {}) };
   const providerStatus = snapshot.providerStatus || {};
+  const now = Date.now();
   const events = (snapshot.usageEvents || [])
     .map(normalizeEvent)
-    .filter((event) => Number.isFinite(event.createdAtMs));
+    .filter((event) => Number.isFinite(event.createdAtMs) && event.createdAtMs <= now);
   const auths = (snapshot.authFiles || [])
     .map(normalizeAuth)
-    .filter(
-      (auth) =>
-        String(auth.accountType || "").toLowerCase() !== "api-key" && auth.hasAccount !== false
-    );
+    .filter((auth) => String(auth.accountType || "").toLowerCase() !== "api-key");
   const apiKeys = (snapshot.apiKeyUsage || []).map(normalizeApiKey);
-  const now = Date.now();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
   const totalTokens = events.reduce((sum, event) => sum + event.totalTokens, 0);
   const totalCost = events.reduce((sum, event) => sum + eventCost(event, quotas), 0);
-  const todayEvents = events.filter((event) => now - event.createdAtMs <= DAY_MS);
+  const todayEvents = events.filter(
+    (event) => event.createdAtMs >= todayStart.getTime() && event.createdAtMs <= now
+  );
   const sevenDayEvents = events.filter((event) => now - event.createdAtMs <= 7 * DAY_MS);
   const thirtyDayEvents = events.filter((event) => now - event.createdAtMs <= 30 * DAY_MS);
   const lastMinuteTokens = events
@@ -570,7 +595,9 @@ function buildDashboard(snapshot) {
     );
 
     const modelTotals = new Map();
-    for (const event of providerEvents) {
+    for (const event of providerEvents.filter(
+      (candidate) => candidate.createdAtMs <= now && now - candidate.createdAtMs <= 7 * DAY_MS
+    )) {
       const model = event.model || "unknown-model";
       const entry = modelTotals.get(model) || { model, tokens: 0, cost: 0 };
       entry.tokens += event.totalTokens;
@@ -602,7 +629,9 @@ function buildDashboard(snapshot) {
     costByDay.set(key, (costByDay.get(key) || 0) + eventCost(event, quotas));
   }
   const history = Array.from({ length: 30 }, (_, index) => {
-    const date = new Date(now - (29 - index) * DAY_MS);
+    const date = new Date(now);
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - (29 - index));
     const key = `${date.getMonth() + 1}/${date.getDate()}`;
     return { day: key, value: costByDay.get(key) || 0 };
   });
@@ -643,56 +672,94 @@ function buildDashboard(snapshot) {
   };
 }
 
+function mergeSnapshot(previous, next) {
+  const fallback = demoSnapshot();
+  const hasKey = !!next.settings?.managementKey;
+  return {
+    ...fallback,
+    ...next,
+    demo: !hasKey && !next.connected,
+    settings: {
+      ...fallback.settings,
+      ...(next.settings || {}),
+      quotas: { ...DEFAULT_QUOTAS, ...(next.settings?.quotas || {}) }
+    },
+    usageEvents: Array.isArray(next.usageEvents) ? next.usageEvents : previous.usageEvents,
+    authFiles: Array.isArray(next.authFiles) ? next.authFiles : previous.authFiles,
+    apiKeyUsage: Array.isArray(next.apiKeyUsage) ? next.apiKeyUsage : previous.apiKeyUsage,
+    usageStatisticsEnabled:
+      typeof next.usageStatisticsEnabled == "boolean"
+        ? next.usageStatisticsEnabled
+        : previous.usageStatisticsEnabled,
+    providerStatus: next.providerStatus || previous.providerStatus
+  };
+}
+
 function useSnapshot() {
   const [snapshot, setSnapshot] = useState(demoSnapshot);
   const [loading, setLoading] = useState(false);
-  const refresh = useCallback(async (options = {}) => {
+  const requestSequence = useRef(0);
+  const refreshTail = useRef(Promise.resolve());
+
+  const applySnapshot = useCallback((next) => {
+    requestSequence.current += 1;
+    setLoading(false);
+    setSnapshot((previous) => mergeSnapshot(previous, next));
+  }, []);
+
+  const updateSnapshot = useCallback((updater) => {
+    requestSequence.current += 1;
+    setLoading(false);
+    setSnapshot(updater);
+  }, []);
+
+  const refresh = useCallback((options = {}) => {
+    const requestId = ++requestSequence.current;
     setLoading(true);
-    try {
-      if (window.clipQuota?.getSnapshot) {
-        const next = await window.clipQuota.getSnapshot({
-          forceQuotaRefresh: options.forceQuotaRefresh === true
-        });
-        const hasKey = !!next.settings?.managementKey;
-        setSnapshot((previous) => ({
-          ...demoSnapshot(),
-          ...next,
-          demo: !hasKey && !next.connected,
-          settings: {
-            ...demoSnapshot().settings,
-            ...(next.settings || {}),
-            quotas: { ...DEFAULT_QUOTAS, ...(next.settings?.quotas || {}) }
-          },
-          usageEvents: Array.isArray(next.usageEvents) ? next.usageEvents : previous.usageEvents,
-          authFiles: Array.isArray(next.authFiles) ? next.authFiles : previous.authFiles,
-          apiKeyUsage: Array.isArray(next.apiKeyUsage) ? next.apiKeyUsage : previous.apiKeyUsage,
-          usageStatisticsEnabled:
-            typeof next.usageStatisticsEnabled == "boolean"
-              ? next.usageStatisticsEnabled
-              : previous.usageStatisticsEnabled,
-          providerStatus: next.providerStatus || previous.providerStatus
-        }));
-      } else {
-        setSnapshot(demoSnapshot());
+    const task = refreshTail.current.catch(() => {}).then(async () => {
+      try {
+        if (window.clipQuota?.getSnapshot) {
+          const next = await window.clipQuota.getSnapshot({
+            forceQuotaRefresh: options.forceQuotaRefresh === true
+          });
+          if (requestId === requestSequence.current) {
+            setSnapshot((previous) => mergeSnapshot(previous, next));
+          }
+          return next;
+        }
+        if (requestId === requestSequence.current) setSnapshot(demoSnapshot());
+        return null;
+      } catch (error) {
+        if (requestId === requestSequence.current) {
+          setSnapshot((previous) => ({
+            ...previous,
+            connected: false,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
+        throw error;
+      } finally {
+        if (requestId === requestSequence.current) setLoading(false);
       }
-    } catch (error) {
-      setSnapshot({ ...demoSnapshot(), error: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setLoading(false);
-    }
+    });
+    refreshTail.current = task;
+    return task;
   }, []);
 
   useEffect(() => {
-    refresh();
+    refresh().catch(() => {});
   }, [refresh]);
 
   useEffect(() => {
     const pollSeconds = toNumber(snapshot.settings?.pollIntervalSec, 1200);
-    const interval = window.setInterval(() => refresh(), Math.max(10, pollSeconds) * 1e3);
+    const interval = window.setInterval(
+      () => refresh({ forceQuotaRefresh: true }).catch(() => {}),
+      Math.max(10, pollSeconds) * 1e3
+    );
     return () => window.clearInterval(interval);
   }, [refresh, snapshot.settings?.pollIntervalSec]);
 
-  return { snapshot, loading, refresh, setSnapshot };
+  return { snapshot, loading, refresh, applySnapshot, updateSnapshot };
 }
 
 function Metric({ label, value, sub }) {
@@ -727,13 +794,14 @@ function CardHeader({ icon: Icon, title, subtitle, badge, action }) {
   );
 }
 
-function IconButton({ label, children, onClick, active = false }) {
+function IconButton({ label, children, onClick, active = false, disabled = false }) {
   return (
     <button
       className={`icon-button ${active ? "active" : ""}`}
       aria-label={label}
       title={label}
       onClick={onClick}
+      disabled={disabled}
       type="button"
     >
       {children}
@@ -1113,11 +1181,11 @@ function CostCard({ dashboard }) {
         </div>
       )}
       <div className="metrics-grid">
-        <Metric label="Total Cost" value={formatMoney(totals.totalCost)} />
+        <Metric label="Stored Cost" value={formatMoney(totals.totalCost)} />
         <Metric label="Today" value={formatMoney(totals.todayCost)} />
         <Metric label="7-Day" value={formatMoney(totals.sevenDayCost)} />
         <Metric label="30-Day" value={formatMoney(totals.thirtyDayCost)} />
-        <Metric label="Total Tok" value={formatTokens(totals.totalTokens)} />
+        <Metric label="Stored Tok" value={formatTokens(totals.totalTokens)} />
         <Metric label="Today Tok" value={formatTokens(totals.todayTokens)} />
         <Metric label="TPM" value={formatTokens(totals.lastMinuteTokens)} />
         <Metric label="Fill" value={`${Math.round(totals.fill)}%`} />
@@ -1129,17 +1197,13 @@ function CostCard({ dashboard }) {
 function HistoryCard({ dashboard }) {
   const max = Math.max(1, ...dashboard.history.map((entry) => entry.value));
   const average = dashboard.history.reduce((sum, entry) => sum + entry.value, 0) / dashboard.history.length;
+  const averagePosition = (average / max) * 100;
   return (
     <Card className="history-card">
       <CardHeader
         icon={CircleDollarSign}
         title="Usage Cost"
         subtitle="CPA cost estimate"
-        action={
-          <IconButton label="Refresh">
-            <RefreshCw size={17} />
-          </IconButton>
-        }
       />
       <div className="cost-mini-grid">
         <Metric
@@ -1158,7 +1222,7 @@ function HistoryCard({ dashboard }) {
           sub={`${formatTokens(dashboard.totals.thirtyDayTokens)} tok`}
         />
         <Metric
-          label="All"
+          label="Stored Total"
           value={formatMoney(dashboard.totals.totalCost)}
           sub={`${formatTokens(dashboard.totals.totalTokens)} tok`}
         />
@@ -1174,21 +1238,20 @@ function HistoryCard({ dashboard }) {
       ) : null}
       <div className="chart-head">
         <strong>Cost History</strong>
-        <div className="segmented small">
-          <button className="active" type="button">
-            30d
-          </button>
-          <button type="button">All</button>
-        </div>
+        <span className="pill blue">30d</span>
       </div>
       <div className="bar-chart">
-        <span className="avg-line" style={{ bottom: `${Math.max(10, (average / max) * 100)}%` }} />
-        <em style={{ bottom: `${Math.max(10, (average / max) * 100)}%` }}>avg {formatMoney(average)}</em>
+        {average > 0 ? (
+          <>
+            <span className="avg-line" style={{ bottom: `${averagePosition}%` }} />
+            <em style={{ bottom: `${averagePosition}%` }}>avg {formatMoney(average)}</em>
+          </>
+        ) : null}
         {dashboard.history.map((entry, index) => (
           <div className="bar-slot" key={`${entry.day}-${index}`}>
             <span
               className={index > dashboard.history.length - 8 ? "hot" : index % 4 === 0 ? "cool" : ""}
-              style={{ height: `${Math.max(3, (entry.value / max) * 100)}%` }}
+              style={{ height: `${entry.value > 0 ? Math.max(3, (entry.value / max) * 100) : 0}%` }}
               title={`${entry.day}: ${formatMoney(entry.value)}`}
             />
             {index % 5 === 0 ? <small>{entry.day}</small> : null}
@@ -1199,14 +1262,17 @@ function HistoryCard({ dashboard }) {
   );
 }
 
-function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
+function SettingsModal({ snapshot, onClose, onSaved, onEnabled, onClear }) {
   const settings = snapshot.settings || demoSnapshot().settings;
   const [draft, setDraft] = useState({
     ...settings,
     managementKey: settings.managementKey === "configured" ? "configured" : settings.managementKey || "",
     quotas: { ...DEFAULT_QUOTAS, ...(settings.quotas || {}) }
   });
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
+  const insecureRemoteUrl = isInsecureRemoteManagementUrl(draft.baseUrl);
 
   const updateQuota = (providerKey, field, value) => {
     setDraft((previous) => ({
@@ -1215,34 +1281,57 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
         ...previous.quotas,
         [providerKey]: {
           ...previous.quotas[providerKey],
-          [field]: field.includes("Tokens") ? Number(value) * 1e6 : value
+          [field]: value
         }
       }
     }));
   };
 
   const save = async () => {
-    setBusy(true);
+    setBusy("save");
+    setActionError("");
+    setActionMessage("");
     try {
-      if (window.clipQuota?.saveSettings) {
-        await window.clipQuota.saveSettings(draft);
-      }
+      if (!window.clipQuota?.saveSettings) throw new Error("Settings are unavailable in this build.");
+      await window.clipQuota.saveSettings(draft);
       await onSaved();
       onClose();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
 
   const enableQueue = async () => {
-    setBusy(true);
+    setBusy("enable");
+    setActionError("");
+    setActionMessage("");
     try {
-      if (window.clipQuota?.enableUsage) {
-        await window.clipQuota.enableUsage();
-      }
-      await onSaved();
+      if (!window.clipQuota?.enableUsage) throw new Error("Usage queue controls are unavailable in this build.");
+      const next = await window.clipQuota.enableUsage();
+      if (!next || typeof next !== "object") throw new Error("CLIProxyAPI returned an invalid snapshot.");
+      onEnabled(next);
+      setActionMessage("Usage queue enabled.");
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(false);
+      setBusy("");
+    }
+  };
+
+  const clearUsage = async () => {
+    if (!window.confirm("Clear all locally stored usage history? This cannot be undone.")) return;
+    setBusy("clear");
+    setActionError("");
+    setActionMessage("");
+    try {
+      await onClear();
+      setActionMessage("Local usage history cleared.");
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy("");
     }
   };
 
@@ -1252,9 +1341,9 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
         <div className="modal-head">
           <div>
             <h2>Settings</h2>
-            <p>Connect CLIProxyAPI and tune quota windows.</p>
+            <p>Connect CLIProxyAPI and configure cost estimates.</p>
           </div>
-          <IconButton label="Close" onClick={onClose}>
+          <IconButton label="Close" onClick={onClose} disabled={Boolean(busy)}>
             <X size={18} />
           </IconButton>
         </div>
@@ -1266,6 +1355,11 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
             placeholder="http://127.0.0.1:8317/v0/management"
           />
         </label>
+        {insecureRemoteUrl ? (
+          <div className="modal-feedback warning" role="note">
+            Remote HTTP sends the Management Key without transport encryption. Use HTTPS or an SSH tunnel.
+          </div>
+        ) : null}
         <label className="field">
           <span>Management Key</span>
           <input
@@ -1289,7 +1383,7 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
             <span>Queue batch</span>
             <input
               type="number"
-              min="20"
+              min="1"
               value={draft.usageQueueBatchSize || 200}
               onChange={(event) => setDraft({ ...draft, usageQueueBatchSize: Number(event.target.value) })}
             />
@@ -1298,8 +1392,6 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
         <div className="quota-table">
           <div className="quota-row head">
             <span>Provider</span>
-            <span>5h MTok</span>
-            <span>Weekly MTok</span>
             <span>$/MTok</span>
           </div>
           {PROVIDER_ORDER.map((providerKey) => {
@@ -1309,16 +1401,7 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
                 <strong>{PROVIDER_META[providerKey].name}</strong>
                 <input
                   type="number"
-                  value={Math.round(toNumber(quota.fiveHourTokens) / 1e6)}
-                  onChange={(event) => updateQuota(providerKey, "fiveHourTokens", event.target.value)}
-                />
-                <input
-                  type="number"
-                  value={Math.round(toNumber(quota.weeklyTokens) / 1e6)}
-                  onChange={(event) => updateQuota(providerKey, "weeklyTokens", event.target.value)}
-                />
-                <input
-                  type="number"
+                  min="0"
                   step="0.1"
                   value={quota.costPerMTok || 0}
                   onChange={(event) => updateQuota(providerKey, "costPerMTok", Number(event.target.value))}
@@ -1327,15 +1410,17 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
             );
           })}
         </div>
+        {actionError ? <div className="modal-feedback error" role="alert">{actionError}</div> : null}
+        {actionMessage ? <div className="modal-feedback success" role="status">{actionMessage}</div> : null}
         <div className="modal-actions">
-          <button className="ghost-button" type="button" onClick={enableQueue} disabled={busy}>
-            <Gauge size={17} /> Enable usage queue
+          <button className="ghost-button" type="button" onClick={enableQueue} disabled={Boolean(busy)}>
+            {busy === "enable" ? <LoaderCircle className="spin" size={17} /> : <Gauge size={17} />} Enable usage queue
           </button>
-          <button className="ghost-button danger" type="button" onClick={onClear}>
-            Clear local history
+          <button className="ghost-button danger" type="button" onClick={clearUsage} disabled={Boolean(busy)}>
+            {busy === "clear" ? <LoaderCircle className="spin" size={17} /> : null} Clear local history
           </button>
-          <button className="primary-button" type="button" onClick={save} disabled={busy}>
-            {busy ? <LoaderCircle className="spin" size={17} /> : <KeyRound size={17} />} Save
+          <button className="primary-button" type="button" onClick={save} disabled={Boolean(busy)}>
+            {busy === "save" ? <LoaderCircle className="spin" size={17} /> : <KeyRound size={17} />} Save
           </button>
         </div>
       </div>
@@ -1344,7 +1429,7 @@ function SettingsModal({ snapshot, onClose, onSaved, onClear }) {
 }
 
 export default function App() {
-  const { snapshot, loading, refresh, setSnapshot } = useSnapshot();
+  const { snapshot, loading, refresh, applySnapshot, updateSnapshot } = useSnapshot();
   const dashboard = useMemo(() => buildDashboard(snapshot), [snapshot]);
   const [tab, setTab] = useState("overview");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1378,10 +1463,9 @@ export default function App() {
   };
 
   const clearUsage = async () => {
-    if (window.clipQuota?.clearUsage) {
-      const next = await window.clipQuota.clearUsage();
-      setSnapshot(next);
-    }
+    if (!window.clipQuota?.clearUsage) throw new Error("Local history controls are unavailable in this build.");
+    await window.clipQuota.clearUsage();
+    updateSnapshot((previous) => ({ ...previous, usageEvents: [], queueAdded: 0 }));
   };
 
   return (
@@ -1419,7 +1503,12 @@ export default function App() {
           <IconButton label={pinned ? "Unpin window" : "Pin window"} onClick={togglePin} active={pinned}>
             {pinned ? <PinOff size={18} /> : <Pin size={18} />}
           </IconButton>
-          <IconButton label="Refresh" onClick={() => refresh({ forceQuotaRefresh: true })} active={loading}>
+          <IconButton
+            label="Refresh"
+            onClick={() => refresh({ forceQuotaRefresh: true }).catch(() => {})}
+            active={loading}
+            disabled={loading}
+          >
             <RefreshCw className={loading ? "spin" : ""} size={18} />
           </IconButton>
           <IconButton label="Settings" onClick={() => setSettingsOpen(true)}>
@@ -1469,6 +1558,7 @@ export default function App() {
           snapshot={snapshot}
           onClose={() => setSettingsOpen(false)}
           onSaved={() => refresh({ forceQuotaRefresh: true })}
+          onEnabled={applySnapshot}
           onClear={clearUsage}
         />
       ) : null}

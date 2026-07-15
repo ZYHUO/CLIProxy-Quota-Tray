@@ -50,7 +50,7 @@ Windows 系统托盘面板，搭配 [CLIProxyAPI](https://github.com/router-for-
      `http://127.0.0.1:8317/v0/management`（只填 `host:port` 也可以，会自动补全路径）。
      CPA 在远程服务器时需要其配置 `remote-management.allow-remote: true`。
    - **Management Key**：CPA 配置里的 `remote-management.secret-key` 明文。
-   - **Poll seconds**：自动刷新间隔，默认与最小值均为 `1200`（20 分钟）。
+   - **Poll seconds**：账号、状态与配额刷新间隔，默认与最小值均为 `1200`（20 分钟）。
    - **Queue batch**：每次从 usage queue 读取的记录数，默认 `200`。
 3. 点 **Save**——连接成功后账号与配额会立刻加载。
 4. 若 Cost 卡片显示 "Queue off"，点 Settings 里的 **Enable usage queue**
@@ -60,10 +60,17 @@ Windows 系统托盘面板，搭配 [CLIProxyAPI](https://github.com/router-for-
 > 落盘到本地 `%APPDATA%\CLIProxy Quota Tray\quota-monitor\usage-events.jsonl`，
 > 后续图表从本地历史计算。同一个 CPA 不要同时开多个消费端，否则成本统计会互相分流。
 
+应用主进程会约每 30 秒独立消费 usage queue，并持续读取到当前队列排空；这个频率不受
+20 分钟配额缓存影响。记录会先落盘，再进行耗时更长的账号与 provider 配额刷新。
+
+> 连接远程 CPA 时建议使用 HTTPS 或 SSH 隧道。只有 `127.0.0.1` / `localhost` 等本机
+> 地址适合直接使用 HTTP，避免 Management Key 在网络中明文传输。
+
 ### 配额刷新语义
 
-- 账号/用量每次轮询都会刷新；**配额窗口默认缓存 20 分钟**（避免频繁请求 OAuth
-  provider 端点），点右上角 ↻ 会强制刷新配额。
+- 账号与官方状态每次界面轮询都会刷新；usage queue 由主进程约每 30 秒独立消费；
+  **配额窗口默认缓存 20 分钟**（避免频繁请求 OAuth provider 端点），点右上角 ↻
+  会强制刷新配额。
 - 账号行显示 `not loaded` = CPA 还没返回该账号的配额数据；如果抓取出错，
   错误原因会以红字显示在账号行内（常见：CPA 版本过旧没有 `/api-call` 端点、
   CPA 服务器出网被 Cloudflare 拦截、账号 token 过期需要重新登录）。
@@ -86,6 +93,8 @@ Provider 配额（经 CPA `/api-call` 代理）：
 官方状态：`status.openai.com` / `status.claude.com` 的 statuspage summary。
 
 ## 开发
+
+需要 Node.js 22.12 或更新版本。
 
 ```bash
 npm install
@@ -120,8 +129,8 @@ makensis -DSRC="release/CLIProxy Quota Tray-win32-x64" \
 **为什么 Grok 没有 5h limit？**
 xAI 的 billing 端点只提供 week / month 两个维度。
 
-**为什么自动刷新不每次都拉配额？**
-配额默认缓存 20 分钟，避免频繁请求 provider 端点；手动 ↻ 强制刷新。
+**配额多久刷新一次？**
+自动轮询默认每 20 分钟强制拉取一次 provider 配额；手动 ↻ 也会强制刷新。
 
 **ChatGPT 配额全部 not loaded？**
 看账号行里的红字错误。最常见的原因是 CPA 服务器自身访问不了

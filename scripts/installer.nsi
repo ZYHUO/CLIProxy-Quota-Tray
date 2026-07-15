@@ -14,7 +14,7 @@
   !define OUTFILE "..\release\CLIProxy-Quota-Tray-Setup.exe"
 !endif
 !ifndef APPVERSION
-  !define APPVERSION "1.0.0"
+  !define APPVERSION "1.0.1"
 !endif
 
 Unicode true

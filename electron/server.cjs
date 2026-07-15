@@ -1,13 +1,17 @@
-const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
 const MAX_STORED_EVENTS = 20000;
-const MAX_RETURNED_EVENTS = 5000;
 const FETCH_TIMEOUT_MS = 15000;
 const STATUS_CACHE_MS = 60000;
 const QUOTA_CACHE_MS = 20 * 60 * 1000;
+const USAGE_COLLECTOR_INTERVAL_MS = 30 * 1000;
+const MIN_POLL_INTERVAL_SEC = 1200;
+const MAX_POLL_INTERVAL_SEC = 24 * 60 * 60;
+const MIN_USAGE_QUEUE_BATCH_SIZE = 1;
+const MAX_USAGE_QUEUE_BATCH_SIZE = 1000;
+const MAX_USAGE_DRAIN_BATCHES = 100;
 const XAI_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const XAI_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 
@@ -38,9 +42,33 @@ function readJSON(filePath, fallback) {
   }
 }
 
-function writeJSON(filePath, value) {
+function atomicWriteFile(filePath, value) {
   ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
+  const tempPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`
+  );
+  try {
+    fs.writeFileSync(tempPath, value, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // The temporary file may already have been renamed or removed.
+    }
+    throw error;
+  }
+}
+
+function writeJSON(filePath, value) {
+  atomicWriteFile(filePath, JSON.stringify(value, null, 2));
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Math.trunc(numeric)));
 }
 
 function hashObject(value) {
@@ -172,6 +200,9 @@ function normalizeAuthFile(auth, index = 0) {
   const name = account || auth.name || auth.filename || auth.file || auth.path || auth.file_path || `oauth-${index}`;
   const provider = normalizeProvider(auth.provider || auth.service || auth.platform || auth.type || name);
   const sourceProvider = String(auth.provider || auth.service || auth.platform || auth.type || "").toLowerCase();
+  const authIndex = auth.auth_index ?? auth.authIndex ?? auth.index ?? null;
+  const accountType = auth.account_type || auth.accountType || auth.type || "oauth";
+  const isIndexedOAuth = String(accountType).toLowerCase() === "oauth" && authIndex != null;
   const statusRaw = String(auth.status || auth.state || auth.health || auth.availability || "").toLowerCase();
   const disabled = auth.disabled === true || auth.enabled === false;
   const unavailable = auth.unavailable === true || auth.available === false;
@@ -183,14 +214,14 @@ function normalizeAuthFile(auth, index = 0) {
   const recentRequests = Array.isArray(auth.recent_requests) ? auth.recent_requests : Array.isArray(auth.recentRequests) ? auth.recentRequests : [];
 
   return {
-    id: String(auth.auth_index ?? auth.index ?? auth.id ?? auth.auth_id ?? name),
-    authIndex: auth.auth_index ?? auth.index ?? null,
+    id: String(auth.auth_index ?? auth.authIndex ?? auth.index ?? auth.id ?? auth.auth_id ?? name),
+    authIndex,
     provider,
     sourceProvider,
-    accountType: auth.account_type || auth.accountType || auth.type || "oauth",
+    accountType,
     account,
     email: firstString(auth.email),
-    hasAccount: Boolean(account),
+    hasAccount: Boolean(account) || isIndexedOAuth,
     name: String(name),
     status: down ? "down" : degraded || failed > success * 0.2 && failed > 2 ? "degraded" : "up",
     disabled,
@@ -447,6 +478,121 @@ function claudePlanLabel(profile) {
   return firstString(account.plan, account.plan_type, account.planType, profile.plan, profile.plan_type, profile.planType);
 }
 
+function normalizeClaudeLimitKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function claudeLimitEntries(usage) {
+  const entries = [];
+  const visited = new Set();
+  const leafFields = [
+    "utilization", "used_percent", "usedPercent", "usage_percent", "usagePercent",
+    "percentage", "percent", "remaining_percent", "remainingPercent", "percent_remaining", "percentRemaining",
+    "resets_at", "resetsAt", "reset_at", "resetAt", "reset_after_seconds", "resetAfterSeconds", "next_reset", "nextReset"
+  ];
+
+  function visit(container, prefix = "") {
+    if (!container || typeof container !== "object" || visited.has(container)) return;
+    visited.add(container);
+
+    if (Array.isArray(container)) {
+      container.forEach((item, index) => {
+        if (!item || typeof item !== "object") return;
+        const nested = plainObject(item.limit) || plainObject(item.quota) || plainObject(item.value);
+        const source = nested ? { ...item, ...nested } : item;
+        const identity = [
+          source.limit_name,
+          source.limitName,
+          source.id,
+          source.key,
+          source.type,
+          source.period,
+          source.window,
+          source.model,
+          source.model_name,
+          source.modelName,
+          source.feature,
+          source.product,
+          source.name
+        ].filter((value) => typeof value === "string" && value.trim()).join("_");
+        const key = normalizeClaudeLimitKey([prefix, identity || `limit_${index + 1}`].filter(Boolean).join("_"));
+        entries.push({ key, source });
+      });
+      return;
+    }
+
+    for (const [rawKey, source] of Object.entries(container)) {
+      if (!source || typeof source !== "object") continue;
+      const key = normalizeClaudeLimitKey([prefix, rawKey].filter(Boolean).join("_"));
+      if (["limits", "usage_limits", "usageLimits", "rate_limits", "rateLimits", "data", "usage"].includes(rawKey)) {
+        visit(source, prefix);
+      } else if (Array.isArray(source) || !leafFields.some((field) => source[field] !== undefined)) {
+        visit(source, key);
+      } else {
+        entries.push({ key, source });
+      }
+    }
+  }
+
+  visit(usage);
+  return entries;
+}
+
+function claudeWindowFromEntry(entry, id, label) {
+  if (!entry?.source || typeof entry.source !== "object") return null;
+  const source = entry.source;
+  const usedPercent = percentField(firstDefined(
+    source.utilization,
+    source.used_percent,
+    source.usedPercent,
+    source.usage_percent,
+    source.usagePercent,
+    source.percentage,
+    source.percent
+  ));
+  const remainingPercent = percentField(firstDefined(
+    source.remaining_percent,
+    source.remainingPercent,
+    source.percent_remaining,
+    source.percentRemaining
+  ));
+  const resetAt = isoFromResetWindow(source);
+  return directQuotaWindow(id, label, { usedPercent, remainingPercent, resetAt });
+}
+
+function parseClaudeQuotaUsage(usage) {
+  const entries = claudeLimitEntries(usage);
+  const exact = (keys) => entries.find((entry) => keys.includes(entry.key));
+  const contains = (parts) => entries.find((entry) => parts.every((part) => entry.key.includes(part)));
+  const isModelSpecific = (entry) => ["sonnet", "opus", "cowork", "oauth_app"].some((part) => entry.key.includes(part));
+  const fiveHourEntry = exact(["five_hour", "5_hour", "five_hours"])
+    || entries.find((entry) => !isModelSpecific(entry) && (/five_?hour/.test(entry.key) || /(^|_)5_?hour/.test(entry.key) || /(^|_)5h($|_)/.test(entry.key)));
+  const weeklyEntry = exact(["seven_day", "7_day", "weekly", "week"])
+    || entries.find((entry) => !isModelSpecific(entry) && (/seven_?day/.test(entry.key) || /(^|_)7_?day/.test(entry.key) || /(^|_)7d($|_)/.test(entry.key) || entry.key.includes("weekly")));
+  const windows = [
+    claudeWindowFromEntry(fiveHourEntry, "five_hour", "5 Hours"),
+    claudeWindowFromEntry(weeklyEntry, "weekly", "Weekly")
+  ].filter(Boolean);
+  const groupSpecs = [
+    { id: "sonnet", label: "Sonnet", keys: ["seven_day_sonnet", "weekly_sonnet"], parts: ["sonnet"] },
+    { id: "opus", label: "Opus", keys: ["seven_day_opus", "weekly_opus"], parts: ["opus"] },
+    { id: "cowork", label: "Cowork", keys: ["seven_day_cowork", "weekly_cowork"], parts: ["cowork"] },
+    { id: "oauth_apps", label: "OAuth Apps", keys: ["seven_day_oauth_apps", "weekly_oauth_apps"], parts: ["oauth", "app"] }
+  ];
+  const groups = [];
+
+  for (const spec of groupSpecs) {
+    const entry = exact(spec.keys) || contains(spec.parts);
+    const window = claudeWindowFromEntry(entry, "weekly", "Weekly");
+    if (window) groups.push({ id: spec.id, label: spec.label, windows: [window] });
+  }
+
+  return { windows: dedupeQuotaWindows(windows), groups };
+}
+
 async function fetchClaudeQuota(rawAuth, normalizedAuth, settings, fetchManagement) {
   const authIndex = normalizedAuth.authIndex;
   if (authIndex == null) throw new Error("missing auth index");
@@ -472,19 +618,9 @@ async function fetchClaudeQuota(rawAuth, normalizedAuth, settings, fetchManageme
 
   if (usageResult.status === "rejected") throw usageResult.reason;
   const usage = apiCallBody(usageResult.value);
-  const specs = [
-    ["five_hour", "five_hour", "5 Hours"],
-    ["seven_day", "weekly", "Weekly"]
-  ];
-  const windows = [];
-
-  for (const [sourceKey, id, label] of specs) {
-    const source = usage?.[sourceKey];
-    if (!source || typeof source !== "object") continue;
-    const usedPercent = percentField(source.utilization ?? source.used_percent ?? source.usedPercent);
-    const resetAt = firstString(source.resets_at, source.resetsAt, source.reset_at, source.resetAt);
-    const window = directQuotaWindow(id, label, { usedPercent, resetAt });
-    if (window) windows.push(window);
+  const parsedQuota = parseClaudeQuotaUsage(usage);
+  if (!parsedQuota.windows.length && !parsedQuota.groups.length) {
+    throw new Error("empty Claude quota response");
   }
 
   const profile = profileResult.status === "fulfilled" ? apiCallBody(profileResult.value) : null;
@@ -492,7 +628,8 @@ async function fetchClaudeQuota(rawAuth, normalizedAuth, settings, fetchManageme
     provider: "anthropic",
     fetchedAt: new Date().toISOString(),
     plan: claudePlanLabel(profile),
-    windows
+    windows: parsedQuota.windows,
+    groups: parsedQuota.groups
   };
 }
 
@@ -797,9 +934,9 @@ function antigravityWindows(payload) {
         : /week/i.test(windowName) || /week/i.test(label)
           ? (isPrimary ? "weekly" : `${groupSlug}-weekly`)
           : `${groupSlug}-${slug(label, `bucket-${bucketIndex + 1}`)}`;
-      const window = quotaWindow(id, label, {
-        remaining_percent: percent,
-        reset_at: firstString(bucket.resetTime, bucket.reset_time)
+      const window = directQuotaWindow(id, label, {
+        remainingPercent: percent,
+        resetAt: firstString(bucket.resetTime, bucket.reset_time)
       });
       if (window) windows.push(window);
     });
@@ -894,7 +1031,7 @@ function normalizeUsageRecord(record) {
   const inputTokens = firstNumber(body?.input_tokens, body?.prompt_tokens, body?.promptTokens, body?.usage?.input_tokens, body?.tokens?.input_tokens);
   const outputTokens = firstNumber(body?.output_tokens, body?.completion_tokens, body?.completionTokens, body?.usage?.output_tokens, body?.tokens?.output_tokens);
   const totalTokens = firstNumber(body?.total_tokens, body?.totalTokens, body?.usage?.total_tokens, body?.tokens?.total_tokens, inputTokens + outputTokens);
-  const authId = String(firstDefined(body?.auth_id, body?.auth_index, body?.["auth-index"], body?.auth_file, body?.authFile, body?.account, body?.email, body?.oauth_id, body?.source, "default"));
+  const authId = String(firstDefined(body?.auth_id, body?.auth_index, body?.authIndex, body?.["auth-index"], body?.auth_file, body?.authFile, body?.account, body?.email, body?.oauth_id, body?.source, "default"));
   const status = Number(body?.status || body?.status_code || body?.response_status || 200);
   const success = status < 400 && body?.error == null && body?.failed !== true;
 
@@ -904,7 +1041,7 @@ function normalizeUsageRecord(record) {
     provider,
     model: String(model),
     authId,
-    authIndex: firstDefined(body?.auth_index, body?.["auth-index"], null),
+    authIndex: firstDefined(body?.auth_index, body?.authIndex, body?.["auth-index"], null),
     inputTokens,
     outputTokens,
     totalTokens,
@@ -959,10 +1096,15 @@ function createDashboardServer({ userDataPath }) {
   const storeDir = path.join(userDataPath, "quota-monitor");
   const settingsPath = path.join(storeDir, "settings.json");
   const usagePath = path.join(storeDir, "usage-events.jsonl");
-  let httpServer = null;
-  let port = null;
   let statusCache = { expiresAt: 0, value: null };
   const quotaCache = new Map();
+  let usageCollectorTimer = null;
+  let usageCollectorIntervalMs = USAGE_COLLECTOR_INTERVAL_MS;
+  let usageDrainPromise = null;
+  let usageCollectorPaused = false;
+  let usageCollectorStopRequested = false;
+  let usageDrainInterruptRequested = false;
+  let lastSnapshot = null;
 
   ensureDir(storeDir);
 
@@ -985,10 +1127,18 @@ function createDashboardServer({ userDataPath }) {
         ...(saved.quotas || {})
       }
     };
-    const pollIntervalSec = Number(merged.pollIntervalSec);
-    if (!Number.isFinite(pollIntervalSec) || pollIntervalSec < 1200) {
-      merged.pollIntervalSec = 1200;
-    }
+    merged.pollIntervalSec = boundedInteger(
+      merged.pollIntervalSec,
+      defaultSettings.pollIntervalSec,
+      MIN_POLL_INTERVAL_SEC,
+      MAX_POLL_INTERVAL_SEC
+    );
+    merged.usageQueueBatchSize = boundedInteger(
+      merged.usageQueueBatchSize,
+      defaultSettings.usageQueueBatchSize,
+      MIN_USAGE_QUEUE_BATCH_SIZE,
+      MAX_USAGE_QUEUE_BATCH_SIZE
+    );
     return { ...merged, baseUrl: normalizeManagementBaseUrl(merged) };
   }
 
@@ -1007,14 +1157,28 @@ function createDashboardServer({ userDataPath }) {
         ...(incoming.quotas || {})
       }
     };
+    merged.pollIntervalSec = boundedInteger(
+      merged.pollIntervalSec,
+      current.pollIntervalSec,
+      MIN_POLL_INTERVAL_SEC,
+      MAX_POLL_INTERVAL_SEC
+    );
+    merged.usageQueueBatchSize = boundedInteger(
+      merged.usageQueueBatchSize,
+      current.usageQueueBatchSize,
+      MIN_USAGE_QUEUE_BATCH_SIZE,
+      MAX_USAGE_QUEUE_BATCH_SIZE
+    );
     writeJSON(settingsPath, merged);
+    quotaCache.clear();
     return merged;
   }
 
-  function readUsageEvents(limit = MAX_RETURNED_EVENTS) {
+  function readUsageEvents(limit = MAX_STORED_EVENTS) {
     if (!fs.existsSync(usagePath)) return [];
     const lines = fs.readFileSync(usagePath, "utf8").split(/\r?\n/).filter(Boolean);
-    return lines.slice(-limit).map((line) => {
+    const boundedLimit = boundedInteger(limit, MAX_STORED_EVENTS, 1, MAX_STORED_EVENTS);
+    return lines.slice(-boundedLimit).map((line) => {
       try {
         return JSON.parse(line);
       } catch {
@@ -1025,7 +1189,8 @@ function createDashboardServer({ userDataPath }) {
 
   function writeUsageEvents(events) {
     const trimmed = events.slice(-MAX_STORED_EVENTS);
-    fs.writeFileSync(usagePath, trimmed.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf8");
+    const contents = trimmed.length ? `${trimmed.map((event) => JSON.stringify(event)).join("\n")}\n` : "";
+    atomicWriteFile(usagePath, contents);
   }
 
   function appendUsageRecords(records) {
@@ -1047,10 +1212,10 @@ function createDashboardServer({ userDataPath }) {
     if (additions.length > 0) {
       const next = [...existing, ...additions].slice(-MAX_STORED_EVENTS);
       writeUsageEvents(next);
-      return { added: additions.length, events: next.slice(-MAX_RETURNED_EVENTS) };
+      return { added: additions.length, events: next };
     }
 
-    return { added: 0, events: existing.slice(-MAX_RETURNED_EVENTS) };
+    return { added: 0, events: existing };
   }
 
   async function fetchManagement(pathname, settings, init = {}) {
@@ -1070,18 +1235,106 @@ function createDashboardServer({ userDataPath }) {
     }
   }
 
+  function drainUsageQueue() {
+    if (usageCollectorPaused) {
+      return Promise.resolve({ added: 0, batches: 0, records: 0, events: readUsageEvents() });
+    }
+    if (usageDrainPromise) return usageDrainPromise;
+
+    const flight = (async () => {
+      const settings = readSettings();
+      const batchSize = boundedInteger(
+        settings.usageQueueBatchSize,
+        defaultSettings.usageQueueBatchSize,
+        MIN_USAGE_QUEUE_BATCH_SIZE,
+        MAX_USAGE_QUEUE_BATCH_SIZE
+      );
+      let added = 0;
+      let batches = 0;
+      let records = 0;
+      let events = readUsageEvents();
+
+      if (!settings.managementKey) {
+        return { added, batches, records, events };
+      }
+
+      while (true) {
+        const payload = await fetchManagement(`/usage-queue?count=${encodeURIComponent(batchSize)}`, settings);
+        const batch = extractArray(payload);
+        batches += 1;
+        records += batch.length;
+
+        if (batch.length) {
+          const appended = appendUsageRecords(batch);
+          added += appended.added;
+          events = appended.events;
+        }
+
+        if (
+          batch.length < batchSize
+          || batches >= MAX_USAGE_DRAIN_BATCHES
+          || usageCollectorStopRequested
+          || usageDrainInterruptRequested
+        ) break;
+      }
+
+      return { added, batches, records, events };
+    })();
+
+    usageDrainPromise = flight;
+    const clearFlight = () => {
+      if (usageDrainPromise === flight) usageDrainPromise = null;
+    };
+    flight.then(clearFlight, clearFlight);
+    return flight;
+  }
+
+  function startUsageCollector(intervalMs = USAGE_COLLECTOR_INTERVAL_MS) {
+    const nextIntervalMs = boundedInteger(intervalMs, USAGE_COLLECTOR_INTERVAL_MS, 5000, 60 * 60 * 1000);
+    if (usageCollectorTimer && usageCollectorIntervalMs === nextIntervalMs) {
+      return { running: true, intervalMs: usageCollectorIntervalMs };
+    }
+    if (usageCollectorTimer) clearInterval(usageCollectorTimer);
+
+    usageCollectorStopRequested = false;
+    usageCollectorIntervalMs = nextIntervalMs;
+    const collect = () => {
+      if (usageCollectorPaused) return;
+      drainUsageQueue().catch(() => {
+        // A snapshot will surface CPA connectivity errors; keep the background loop alive.
+      });
+    };
+    collect();
+    usageCollectorTimer = setInterval(collect, usageCollectorIntervalMs);
+    usageCollectorTimer.unref?.();
+    return { running: true, intervalMs: usageCollectorIntervalMs };
+  }
+
+  async function stopUsageCollector() {
+    usageCollectorStopRequested = true;
+    if (usageCollectorTimer) {
+      clearInterval(usageCollectorTimer);
+      usageCollectorTimer = null;
+    }
+    if (usageDrainPromise) {
+      await usageDrainPromise.catch(() => {});
+    }
+    return { running: false, intervalMs: usageCollectorIntervalMs };
+  }
+
   async function fetchOAuthQuotaCached(rawAuth, normalizedAuth, settings, forceRefresh = false) {
     const sourceProvider = sourceProviderKey(normalizedAuth);
     const authIndex = normalizedAuth.authIndex;
     if (authIndex == null || String(normalizedAuth.accountType || "").toLowerCase() === "api-key") {
       return null;
     }
-    if (normalizedAuth.hasAccount === false) {
+    const indexedOAuth = String(normalizedAuth.accountType || "").toLowerCase() === "oauth" && authIndex != null;
+    if (normalizedAuth.hasAccount === false && !indexedOAuth) {
       return null;
     }
 
     const project = antigravityProjectId(rawAuth);
-    const cacheKey = `${sourceProvider}:${authIndex}:${project || ""}`;
+    const cacheKey = `${normalizeManagementBaseUrl(settings)}:${sourceProvider}:${authIndex}:${project || ""}`;
     const cached = quotaCache.get(cacheKey);
     if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
       return cached.value;
@@ -1098,7 +1351,10 @@ function createDashboardServer({ userDataPath }) {
       value = await fetchAntigravityQuota(rawAuth, normalizedAuth, settings, fetchManagement);
     }
 
-    if (value && Array.isArray(value.windows) && value.windows.length) {
+    if (value && (
+      Array.isArray(value.windows) && value.windows.length
+      || Array.isArray(value.groups) && value.groups.length
+    )) {
       quotaCache.set(cacheKey, {
         expiresAt: Date.now() + QUOTA_CACHE_MS,
         value
@@ -1181,19 +1437,12 @@ function createDashboardServer({ userDataPath }) {
     return statusCache.value;
   }
 
-  async function collectSnapshot(options = {}) {
-    const settings = readSettings();
-    const forceQuotaRefresh = options?.forceQuotaRefresh === true || options?.force === true;
-    const startedAt = new Date().toISOString();
-    const statusSnapshot = await fetchProviderStatus().catch((error) => ({
-      statuses: {},
-      errors: { status: error instanceof Error ? error.message : String(error) },
-      fetchedAt: new Date().toISOString()
-    }));
-    const result = {
+  function emptySnapshot(overrides = {}) {
+    const cachedStatus = statusCache.value || { statuses: {}, errors: {} };
+    return {
       settings: getPublicSettings(),
-      server: { port, storeDir },
-      lastUpdated: startedAt,
+      server: { port: null, storeDir },
+      lastUpdated: new Date().toISOString(),
       connected: false,
       error: null,
       queueAdded: 0,
@@ -1201,20 +1450,55 @@ function createDashboardServer({ userDataPath }) {
       usageEvents: readUsageEvents(),
       apiKeyUsage: [],
       usageStatisticsEnabled: null,
+      providerStatus: cachedStatus.statuses || {},
+      providerStatusErrors: cachedStatus.errors || {},
+      ...overrides
+    };
+  }
+
+  function rememberSnapshot(snapshot) {
+    lastSnapshot = snapshot;
+    return snapshot;
+  }
+
+  async function collectSnapshot(options = {}) {
+    const settings = readSettings();
+    const forceQuotaRefresh = options?.forceQuotaRefresh === true || options?.force === true;
+    const startedAt = new Date().toISOString();
+    let drainResult = { added: 0, batches: 0, records: 0, events: readUsageEvents() };
+    let drainError = null;
+
+    if (options?.skipUsageDrain !== true) {
+      try {
+        drainResult = await drainUsageQueue();
+      } catch (error) {
+        drainError = error;
+      }
+    }
+
+    const statusSnapshot = await fetchProviderStatus().catch((error) => ({
+      statuses: {},
+      errors: { status: error instanceof Error ? error.message : String(error) },
+      fetchedAt: new Date().toISOString()
+    }));
+    const result = emptySnapshot({
+      lastUpdated: startedAt,
+      error: drainError ? (drainError instanceof Error ? drainError.message : String(drainError)) : null,
+      queueAdded: drainResult.added,
+      usageEvents: readUsageEvents(),
       providerStatus: statusSnapshot.statuses,
       providerStatusErrors: statusSnapshot.errors
-    };
+    });
 
     if (!settings.managementKey) {
       result.error = "Management key is not configured.";
-      return result;
+      return rememberSnapshot(result);
     }
 
     try {
-      const [authFilesPayload, enabledPayload, usagePayload, apiKeyUsagePayload] = await Promise.allSettled([
+      const [authFilesPayload, enabledPayload, apiKeyUsagePayload] = await Promise.allSettled([
         fetchManagement("/auth-files?all=true", settings),
         fetchManagement("/usage-statistics-enabled", settings),
-        fetchManagement(`/usage-queue?count=${encodeURIComponent(settings.usageQueueBatchSize || 200)}`, settings),
         fetchManagement("/api-key-usage", settings)
       ]);
 
@@ -1226,28 +1510,32 @@ function createDashboardServer({ userDataPath }) {
         result.usageStatisticsEnabled = booleanFromPayload(enabledPayload.value, "usage-statistics-enabled", "enabled", "value");
       }
 
-      if (usagePayload.status === "fulfilled") {
-        const usageRecords = extractArray(usagePayload.value);
-        const appended = appendUsageRecords(usageRecords);
-        result.queueAdded = appended.added;
-        result.usageEvents = appended.events;
-      } else if (usagePayload.reason) {
-        result.error = usagePayload.reason.message;
-      }
-
       if (apiKeyUsagePayload.status === "fulfilled") {
         result.apiKeyUsage = normalizeApiKeyUsage(apiKeyUsagePayload.value);
       }
 
-      if (authFilesPayload.status === "rejected" && usagePayload.status === "rejected") {
-        throw authFilesPayload.reason;
+      const managementErrors = [
+        ["auth files", authFilesPayload],
+        ["usage statistics", enabledPayload],
+        ["API key usage", apiKeyUsagePayload]
+      ].filter(([, item]) => item.status === "rejected").map(([label, item]) => {
+        const message = item.reason instanceof Error ? item.reason.message : String(item.reason);
+        return `${label}: ${message}`;
+      });
+      if (managementErrors.length) {
+        result.error = [result.error, ...managementErrors].filter(Boolean).join("; ");
+      }
+
+      if (authFilesPayload.status === "rejected" && enabledPayload.status === "rejected" && apiKeyUsagePayload.status === "rejected") {
+        result.connected = false;
+        return rememberSnapshot(result);
       }
 
       result.connected = true;
-      return result;
+      return rememberSnapshot(result);
     } catch (error) {
       result.error = error instanceof Error ? error.message : String(error);
-      return result;
+      return rememberSnapshot(result);
     }
   }
 
@@ -1257,90 +1545,53 @@ function createDashboardServer({ userDataPath }) {
       method: "PUT",
       body: JSON.stringify({ value: true })
     });
-    return collectSnapshot({ forceQuotaRefresh: true });
+    return rememberSnapshot(lastSnapshot
+      ? {
+          ...lastSnapshot,
+          settings: getPublicSettings(),
+          lastUpdated: new Date().toISOString(),
+          connected: true,
+          error: null,
+          usageStatisticsEnabled: true
+        }
+      : emptySnapshot({ connected: true, usageStatisticsEnabled: true }));
   }
 
-  function clearUsage() {
-    writeUsageEvents([]);
-    return collectSnapshot();
-  }
-
-  function sendJSON(response, statusCode, payload) {
-    response.writeHead(statusCode, {
-      "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
-      "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "content-type"
-    });
-    response.end(JSON.stringify(payload));
-  }
-
-  async function readBody(request) {
-    const chunks = [];
-    for await (const chunk of request) {
-      chunks.push(chunk);
-    }
-    const text = Buffer.concat(chunks).toString("utf8");
-    return text ? JSON.parse(text) : {};
-  }
-
-  async function handleRequest(request, response) {
+  async function clearUsage() {
+    usageCollectorPaused = true;
+    usageDrainInterruptRequested = true;
     try {
-      const url = new URL(request.url, `http://${request.headers.host || "127.0.0.1"}`);
-      if (request.method === "OPTIONS") {
-        sendJSON(response, 200, { ok: true });
-        return;
-      }
-      if (request.method === "GET" && url.pathname === "/api/snapshot") {
-        sendJSON(response, 200, await collectSnapshot({ forceQuotaRefresh: url.searchParams.get("refresh") === "1" || url.searchParams.get("force") === "1" }));
-        return;
-      }
-      if (request.method === "GET" && url.pathname === "/api/status") {
-        sendJSON(response, 200, await fetchProviderStatus());
-        return;
-      }
-      if (request.method === "GET" && url.pathname === "/api/settings") {
-        sendJSON(response, 200, getPublicSettings());
-        return;
-      }
-      if (request.method === "POST" && url.pathname === "/api/settings") {
-        sendJSON(response, 200, { settings: { ...writeSettings(await readBody(request)), managementKey: "configured" } });
-        return;
-      }
-      if (request.method === "POST" && url.pathname === "/api/usage/clear") {
-        sendJSON(response, 200, await clearUsage());
-        return;
-      }
-      if (request.method === "POST" && url.pathname === "/api/usage/enable") {
-        sendJSON(response, 200, await enableUsageStatistics());
-        return;
-      }
-      sendJSON(response, 404, { error: "not found" });
-    } catch (error) {
-      sendJSON(response, 500, { error: error instanceof Error ? error.message : String(error) });
+      if (usageDrainPromise) await usageDrainPromise.catch(() => {});
+      writeUsageEvents([]);
+      return rememberSnapshot(lastSnapshot
+        ? {
+            ...lastSnapshot,
+            settings: getPublicSettings(),
+            lastUpdated: new Date().toISOString(),
+            queueAdded: 0,
+            usageEvents: []
+          }
+        : emptySnapshot({ usageEvents: [] }));
+    } finally {
+      usageDrainInterruptRequested = false;
+      usageCollectorPaused = false;
     }
   }
 
   async function start() {
-    if (httpServer) return { port, url: `http://127.0.0.1:${port}` };
-    httpServer = http.createServer(handleRequest);
-    await new Promise((resolve, reject) => {
-      httpServer.once("error", reject);
-      httpServer.listen(0, "127.0.0.1", resolve);
-    });
-    port = httpServer.address().port;
-    return { port, url: `http://127.0.0.1:${port}` };
+    startUsageCollector();
+    return { port: null, url: null };
   }
 
-  function stop() {
-    if (!httpServer) return Promise.resolve();
-    return new Promise((resolve) => httpServer.close(resolve));
-  }
+  const stop = stopUsageCollector;
 
   return {
     start,
     stop,
-    getInfo: () => ({ port, url: port ? `http://127.0.0.1:${port}` : null, storeDir }),
+    startUsageCollector,
+    stopUsageCollector,
+    drainUsageQueue,
+    getInfo: () => ({ port: null, url: null, storeDir }),
     getStoreDir,
     getPublicSettings,
     writeSettings,
@@ -1355,5 +1606,17 @@ module.exports = {
   createDashboardServer,
   normalizeProvider,
   normalizeManagementBaseUrl,
-  defaultSettings
+  defaultSettings,
+  __test: {
+    MAX_STORED_EVENTS,
+    MAX_USAGE_DRAIN_BATCHES,
+    USAGE_COLLECTOR_INTERVAL_MS,
+    antigravityWindows,
+    atomicWriteFile,
+    boundedInteger,
+    normalizeAuthFile,
+    normalizeUsageRecord,
+    parseClaudeQuotaUsage,
+    ratioToPercent
+  }
 };

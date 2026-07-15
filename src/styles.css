@@ -194,6 +194,9 @@ button { color: inherit; }
 .icon-button:hover { color: var(--bright); background: var(--bg-hover); }
 .icon-button:active { transform: scale(0.92); }
 .icon-button.active { color: var(--accent); background: var(--accent-dim); }
+.icon-button:disabled { opacity: 0.55; cursor: default; transform: none; }
+.icon-button:disabled:hover { color: var(--muted); background: transparent; }
+.icon-button.active:disabled { color: var(--accent); background: var(--accent-dim); }
 
 /* ---------- notice banner ---------- */
 .notice {
@@ -1084,7 +1087,7 @@ button { color: inherit; }
 }
 .quota-row {
   display: grid;
-  grid-template-columns: 1.1fr 1fr 1fr 0.8fr;
+  grid-template-columns: 1.1fr 0.8fr;
   gap: 8px;
   align-items: center;
   padding: 8px 10px;
@@ -1101,6 +1104,30 @@ button { color: inherit; }
 }
 .quota-row strong { font-size: 12px; font-weight: 700; color: var(--bright); }
 .quota-row input { height: 30px; font-size: 11px; }
+
+.modal-feedback {
+  margin: -4px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.modal-feedback.error {
+  color: var(--bad);
+  background: var(--bad-dim);
+  border-color: rgba(251, 113, 133, 0.22);
+}
+.modal-feedback.success {
+  color: var(--good);
+  background: var(--good-dim);
+  border-color: rgba(52, 211, 153, 0.22);
+}
+.modal-feedback.warning {
+  color: var(--warn);
+  background: var(--warn-dim);
+  border-color: rgba(251, 191, 36, 0.22);
+}
 
 .modal-actions {
   display: flex;
@@ -1128,6 +1155,7 @@ button { color: inherit; }
 .primary-button:disabled { opacity: 0.55; cursor: default; filter: none; }
 .ghost-button { color: var(--text); background: var(--bg-3); border: 1px solid var(--border); }
 .ghost-button:hover { background: var(--bg-hover); }
+.ghost-button:disabled { opacity: 0.55; cursor: default; }
 .ghost-button.danger { color: var(--bad); background: var(--bad-dim); border-color: rgba(251, 113, 133, 0.25); }
 .ghost-button.danger:hover { background: rgba(251, 113, 133, 0.16); }
 

@@ -10,10 +10,14 @@ implementation decisions.
 - Subscription or plan labels belong only on individual OAuth account rows.
 - API key traffic is separate from OAuth accounts because many API keys are
   third-party OpenAI-compatible endpoints, not real OpenAI accounts.
-- OAuth accounts without account/email identity should not be displayed in
-  provider cards.
+- OAuth accounts without account/email identity are still valid. Display them
+  using label/name/path/id fallbacks and fetch quota whenever an OAuth
+  `auth_index` is available.
 - Grok/xAI quota has week and month windows only. Do not add a fake 5-hour limit.
 - Quota polling defaults to 20 minutes. Manual refresh can force quota refresh.
+- Usage queue consumption is independent from quota polling. It runs in the
+  Electron main process about every 30 seconds, drains all available batches,
+  and persists records before any slower quota work.
 - Status strips are for official provider endpoints/components, not for every
   OAuth account.
 - Quota fetch errors must stay visible: `server.cjs` stores them in
@@ -22,8 +26,9 @@ implementation decisions.
 
 ## Important Files
 
-- `electron/server.cjs`: local dashboard server, CPA management calls,
-  provider quota fetchers.
+- `electron/server.cjs`: local data service, usage collector, CPA management
+  calls, and provider quota fetchers. It must not expose an unauthenticated
+  localhost HTTP API; the renderer communicates only through Electron IPC.
 - `electron/main.cjs`: Electron tray/window lifecycle and startup integration.
 - `electron/preload.cjs`: renderer bridge (`window.clipQuota`).
 - `src/App.jsx`: dashboard data shaping and React UI.
@@ -34,10 +39,11 @@ implementation decisions.
 
 ## Data Flow
 
-1. Electron starts a local HTTP server on `127.0.0.1` with a random free port.
-2. Renderer calls the preload bridge, then `GET /api/snapshot`.
-3. Server reads the CPA Management API: `/auth-files?all=true`,
-   `/usage-statistics-enabled`, `/usage-queue?count=...`, `/api-key-usage`.
+1. Electron starts the main-process usage collector and creates the tray UI.
+2. Renderer calls the narrow preload IPC bridge for snapshots and settings.
+3. The collector drains CPA `/usage-queue?count=...` independently and writes
+   records to local history immediately. Snapshot refreshes read
+   `/auth-files?all=true`, `/usage-statistics-enabled`, and `/api-key-usage`.
 4. Provider-specific OAuth quota is fetched through CPA `POST /api-call`
    with the `$TOKEN$` placeholder (CPA injects and refreshes the OAuth token).
 5. Usage queue records are appended to local JSONL history
