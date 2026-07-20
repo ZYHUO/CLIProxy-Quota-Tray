@@ -1,6 +1,11 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const {
+  createCursorUsageCollector,
+  defaultCursorStateDbPath,
+  normalizeCursorUsage
+} = require("./cursor-usage.cjs");
 
 const MAX_STORED_EVENTS = 20000;
 const FETCH_TIMEOUT_MS = 15000;
@@ -20,11 +25,15 @@ const defaultSettings = {
   managementKey: "",
   pollIntervalSec: 1200,
   usageQueueBatchSize: 200,
+  cursorUsageEnabled: true,
+  cursorStateDbPath: "",
   quotas: {
     openai: { fiveHourTokens: 400000000, weeklyTokens: 3000000000, costPerMTok: 7.5, label: "" },
     anthropic: { fiveHourTokens: 320000000, weeklyTokens: 2500000000, costPerMTok: 9.0, label: "" },
     google: { fiveHourTokens: 800000000, weeklyTokens: 5000000000, costPerMTok: 1.5, label: "" },
     xai: { fiveHourTokens: 250000000, weeklyTokens: 1800000000, costPerMTok: 4.0, label: "" },
+    kimi: { fiveHourTokens: 200000000, weeklyTokens: 1500000000, costPerMTok: 2.5, label: "" },
+    cursor: { fiveHourTokens: 100000000, weeklyTokens: 700000000, costPerMTok: 5.0, label: "" },
     misc: { fiveHourTokens: 100000000, weeklyTokens: 700000000, costPerMTok: 3.0, label: "" }
   }
 };
@@ -97,11 +106,29 @@ function booleanFromPayload(payload, ...keys) {
 
 function normalizeProvider(value = "") {
   const raw = String(value || "").toLowerCase();
+  // CPA auth-files use provider keys: codex, claude, antigravity, xai, kimi, vertex, gemini(-cli), cursor.
   if (raw.includes("openai") || raw.includes("chatgpt") || raw.includes("codex")) return "openai";
   if (raw.includes("anthropic") || raw.includes("claude")) return "anthropic";
-  if (raw.includes("google") || raw.includes("gemini") || raw.includes("antigravity")) return "google";
+  if (raw.includes("kimi") || raw.includes("moonshot")) return "kimi";
+  if (raw.includes("cursor")) return "cursor";
   if (raw.includes("grok") || raw.includes("xai") || raw.includes("x.ai")) return "xai";
+  if (
+    raw.includes("google")
+    || raw.includes("gemini")
+    || raw.includes("antigravity")
+    || raw.includes("vertex")
+  ) return "google";
   return "misc";
+}
+
+function isApiKeyAccountType(value) {
+  const raw = String(value || "").toLowerCase().replace(/[_-]/g, "");
+  return raw === "apikey";
+}
+
+function isOAuthAccountType(value) {
+  const raw = String(value || "").toLowerCase();
+  return raw === "oauth" || raw === "oauth2" || raw === "";
 }
 
 function firstString(...values) {
@@ -131,10 +158,13 @@ function normalizeManagementBaseUrl(settings) {
     url = new URL(defaultSettings.baseUrl);
   }
 
-  url.pathname = url.pathname.replace(/\/+/g, "/").replace(/\/$/, "");
-  if (!url.pathname.endsWith("/v0/management") && !url.pathname.endsWith("/management")) {
-    url.pathname = `${url.pathname}/v0/management`.replace(/\/+/g, "/");
+  let pathname = url.pathname.replace(/\/+/g, "/").replace(/\/$/, "");
+  if (pathname === "/v0" || pathname.endsWith("/v0")) {
+    pathname = `${pathname}/management`;
+  } else if (!pathname.endsWith("/v0/management") && !pathname.endsWith("/management")) {
+    pathname = `${pathname}/v0/management`;
   }
+  url.pathname = pathname.replace(/\/+/g, "/") || "/";
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/$/, "");
@@ -197,12 +227,13 @@ function maskSecret(value = "") {
 function normalizeAuthFile(auth, index = 0) {
   const account = firstString(auth.account, auth.email, auth.username, auth.user);
   const label = firstString(auth.label, auth.display_name, auth.email, auth.account);
-  const name = account || auth.name || auth.filename || auth.file || auth.path || auth.file_path || `oauth-${index}`;
+  const name = account || auth.name || auth.filename || auth.file || auth.path || auth.file_path || label || `oauth-${index}`;
+  // CPA sets both `provider` and `type` to the provider key (codex/kimi/...). Never treat `type` as account_type.
   const provider = normalizeProvider(auth.provider || auth.service || auth.platform || auth.type || name);
   const sourceProvider = String(auth.provider || auth.service || auth.platform || auth.type || "").toLowerCase();
   const authIndex = auth.auth_index ?? auth.authIndex ?? auth.index ?? null;
-  const accountType = auth.account_type || auth.accountType || auth.type || "oauth";
-  const isIndexedOAuth = String(accountType).toLowerCase() === "oauth" && authIndex != null;
+  const accountType = auth.account_type || auth.accountType || "oauth";
+  const isIndexedOAuth = isOAuthAccountType(accountType) && authIndex != null;
   const statusRaw = String(auth.status || auth.state || auth.health || auth.availability || "").toLowerCase();
   const disabled = auth.disabled === true || auth.enabled === false;
   const unavailable = auth.unavailable === true || auth.available === false;
@@ -294,7 +325,16 @@ function normalizeQuota(auth) {
   }
 
   return {
-    plan: firstString(auth.plan, auth.plan_type, auth.planType, quota.plan, quota.plan_type, quota.planType),
+    plan: firstString(
+      auth.plan,
+      auth.plan_type,
+      auth.planType,
+      auth.membership_type,
+      auth.membershipType,
+      quota.plan,
+      quota.plan_type,
+      quota.planType
+    ),
     windows
   };
 }
@@ -432,7 +472,13 @@ function mergeQuota(existing = {}, incoming = {}) {
       ? incoming.windows
       : Array.isArray(existing.windows)
         ? existing.windows
-        : []
+        : [],
+    groups: Array.isArray(incoming.groups) && incoming.groups.length
+      ? incoming.groups
+      : Array.isArray(existing.groups)
+        ? existing.groups
+        : existing.groups,
+    cursorUsage: incoming.cursorUsage || existing.cursorUsage || null
   };
 }
 
@@ -591,6 +637,179 @@ function parseClaudeQuotaUsage(usage) {
   }
 
   return { windows: dedupeQuotaWindows(windows), groups };
+}
+
+function kimiMembershipLabel(level) {
+  const raw = String(level || "").trim().toUpperCase();
+  if (!raw) return "";
+  const mapped = {
+    LEVEL_FREE: "Free",
+    LEVEL_BASIC: "Basic",
+    LEVEL_ENTERPRISE: "Enterprise",
+    LEVEL_INTERMEDIATE: "Moderato",
+    LEVEL_ADVANCED: "Allegretto",
+    LEVEL_PRO: "Pro",
+    LEVEL_ANDANTE: "Andante",
+    LEVEL_MODERATO: "Moderato",
+    LEVEL_ALLEGRETTO: "Allegretto"
+  };
+  if (mapped[raw]) return mapped[raw];
+  return raw
+    .replace(/^LEVEL_/, "")
+    .toLowerCase()
+    .replace(/(^|_)(\w)/g, (_, _sep, char) => char.toUpperCase());
+}
+
+function kimiDetailWindow(id, label, detail = {}) {
+  if (!detail || typeof detail !== "object") return null;
+  const limit = firstNumber(detail.limit, detail.total, detail.quota);
+  const remaining = firstNumber(detail.remaining, detail.available, detail.left);
+  const used = firstNumber(detail.used, detail.current, detail.consumed, limit != null && remaining != null ? limit - remaining : null);
+  const remainingPercent = limit > 0 && remaining != null
+    ? clampPercent((remaining / limit) * 100)
+    : percentField(detail.remaining_percent ?? detail.remainingPercent);
+  const usedPercent = limit > 0 && used != null
+    ? clampPercent((used / limit) * 100)
+    : percentField(detail.used_percent ?? detail.usedPercent);
+  const resetAt = firstString(detail.resetTime, detail.reset_time, detail.resetAt, detail.reset_at, detail.resets_at, detail.resetsAt);
+  const window = directQuotaWindow(id, label, { remainingPercent, usedPercent, resetAt });
+  if (!window) return null;
+  if (limit != null) {
+    window.limit = limit;
+    window.used = used || 0;
+    window.remaining = remaining != null ? remaining : Math.max(0, limit - (used || 0));
+  }
+  return window;
+}
+
+function kimiWindowDurationMinutes(window = {}) {
+  const duration = Number(window.duration);
+  if (!Number.isFinite(duration) || duration <= 0) return null;
+  const unit = String(window.timeUnit || window.time_unit || "").toUpperCase();
+  if (unit.includes("HOUR")) return duration * 60;
+  if (unit.includes("DAY")) return duration * 24 * 60;
+  if (unit.includes("SECOND")) return duration / 60;
+  return duration; // default TIME_UNIT_MINUTE
+}
+
+function parseKimiQuotaUsage(payload = {}) {
+  const usage = plainObject(payload.usage) || {};
+  const weekly = kimiDetailWindow("weekly", "Weekly", usage);
+  const windows = [];
+  if (weekly) windows.push(weekly);
+
+  const limits = Array.isArray(payload.limits) ? payload.limits : [];
+  for (const item of limits) {
+    if (!item || typeof item !== "object") continue;
+    const detail = plainObject(item.detail) || item;
+    const minutes = kimiWindowDurationMinutes(plainObject(item.window) || {});
+    // Kimi Code rate limit is typically a 300-minute (5h) window.
+    if (minutes != null && minutes >= 240 && minutes <= 360) {
+      const fiveHour = kimiDetailWindow("five_hour", "5 Hours", detail);
+      if (fiveHour) windows.push(fiveHour);
+    }
+  }
+
+  const membership = plainObject(plainObject(payload.user)?.membership) || {};
+  return {
+    windows: dedupeQuotaWindows(windows),
+    plan: kimiMembershipLabel(membership.level || membership.plan || membership.tier)
+  };
+}
+
+async function fetchKimiQuota(rawAuth, normalizedAuth, settings, fetchManagement) {
+  const authIndex = normalizedAuth.authIndex;
+  if (authIndex == null) throw new Error("missing auth index");
+  const response = await fetchApiCall(fetchManagement, settings, {
+    authIndex,
+    method: "GET",
+    url: "https://api.kimi.com/coding/v1/usages",
+    header: {
+      Authorization: "Bearer $TOKEN$",
+      Accept: "application/json"
+    }
+  });
+  const usage = apiCallBody(response);
+  const parsed = parseKimiQuotaUsage(usage);
+  if (!parsed.windows.length) throw new Error("empty Kimi quota response");
+  return {
+    provider: "kimi",
+    fetchedAt: new Date().toISOString(),
+    plan: parsed.plan,
+    windows: parsed.windows,
+    groups: []
+  };
+}
+
+function cursorQuotaFromUsage(normalized = {}) {
+  const plan = plainObject(normalized.plan) || {};
+  const windows = [];
+  const included = directQuotaWindow("monthly", "Included", {
+    remainingPercent: plan.remainingPercent,
+    usedPercent: plan.usedPercent,
+    resetAt: normalized.billingCycleEnd || ""
+  });
+  if (included) {
+    if (Number.isFinite(Number(plan.limitUsd))) {
+      included.limit = Number(plan.limitUsd);
+      included.used = Number.isFinite(Number(plan.includedSpendUsd)) ? Number(plan.includedSpendUsd) : 0;
+      included.remaining = Number.isFinite(Number(plan.remainingUsd))
+        ? Number(plan.remainingUsd)
+        : Math.max(0, included.limit - included.used);
+    }
+    windows.push(included);
+  }
+
+  const groups = [];
+  if (plan.autoPercentUsed != null) {
+    const auto = directQuotaWindow("monthly", "Auto pool", { usedPercent: plan.autoPercentUsed });
+    if (auto) groups.push({ id: "auto", label: "Auto", windows: [auto] });
+  }
+  if (plan.apiPercentUsed != null) {
+    const api = directQuotaWindow("monthly", "API pool", { usedPercent: plan.apiPercentUsed });
+    if (api) groups.push({ id: "api", label: "API", windows: [api] });
+  }
+
+  return {
+    provider: "cursor",
+    fetchedAt: normalized.fetchedAt || new Date().toISOString(),
+    plan: String(normalized.membershipType || "").trim(),
+    windows: dedupeQuotaWindows(windows),
+    groups,
+    cursorUsage: normalized
+  };
+}
+
+async function fetchCursorQuota(rawAuth, normalizedAuth, settings, fetchManagement) {
+  const authIndex = normalizedAuth.authIndex;
+  if (authIndex == null) throw new Error("missing auth index");
+  const response = await fetchApiCall(fetchManagement, settings, {
+    authIndex,
+    method: "POST",
+    url: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+    header: {
+      Authorization: "Bearer $TOKEN$",
+      "Content-Type": "application/json",
+      "connect-protocol-version": "1"
+    },
+    // CPA rejects object bodies with "invalid body"; empty JSON must be a string.
+    data: "{}"
+  });
+  const payload = apiCallBody(response);
+  const email = firstString(normalizedAuth.email, normalizedAuth.account, normalizedAuth.label);
+  const normalized = normalizeCursorUsage(payload, {
+    email,
+    membershipType: firstString(
+      normalizedAuth.plan,
+      rawAuth?.membership_type,
+      rawAuth?.membershipType,
+      payload?.membershipType,
+      "unknown"
+    )
+  });
+  const quota = cursorQuotaFromUsage({ ...normalized, source: "cpa" });
+  if (!quota.windows.length) throw new Error("empty Cursor quota response");
+  return quota;
 }
 
 async function fetchClaudeQuota(rawAuth, normalizedAuth, settings, fetchManagement) {
@@ -1105,8 +1324,18 @@ function createDashboardServer({ userDataPath }) {
   let usageCollectorStopRequested = false;
   let usageDrainInterruptRequested = false;
   let lastSnapshot = null;
+  let cursorUsageCollector = null;
 
   ensureDir(storeDir);
+
+  function getCursorCollector() {
+    const settings = readSettings();
+    const stateDbPath = String(settings.cursorStateDbPath || "").trim() || defaultCursorStateDbPath();
+    if (!cursorUsageCollector || cursorUsageCollector.stateDbPath !== stateDbPath) {
+      cursorUsageCollector = Object.assign(createCursorUsageCollector({ stateDbPath }), { stateDbPath });
+    }
+    return cursorUsageCollector;
+  }
 
   function getStoreDir() {
     return storeDir;
@@ -1114,7 +1343,11 @@ function createDashboardServer({ userDataPath }) {
 
   function getPublicSettings() {
     const settings = readSettings();
-    return { ...settings, managementKey: settings.managementKey ? "configured" : "" };
+    return {
+      ...settings,
+      managementKey: settings.managementKey ? "configured" : "",
+      cursorStateDbPath: settings.cursorStateDbPath || defaultCursorStateDbPath()
+    };
   }
 
   function readSettings() {
@@ -1139,6 +1372,8 @@ function createDashboardServer({ userDataPath }) {
       MIN_USAGE_QUEUE_BATCH_SIZE,
       MAX_USAGE_QUEUE_BATCH_SIZE
     );
+    merged.cursorUsageEnabled = merged.cursorUsageEnabled !== false;
+    merged.cursorStateDbPath = String(merged.cursorStateDbPath || "").trim();
     return { ...merged, baseUrl: normalizeManagementBaseUrl(merged) };
   }
 
@@ -1169,8 +1404,19 @@ function createDashboardServer({ userDataPath }) {
       MIN_USAGE_QUEUE_BATCH_SIZE,
       MAX_USAGE_QUEUE_BATCH_SIZE
     );
+    if (typeof incoming.cursorUsageEnabled === "boolean") {
+      merged.cursorUsageEnabled = incoming.cursorUsageEnabled;
+    } else {
+      merged.cursorUsageEnabled = current.cursorUsageEnabled !== false;
+    }
+    if (Object.prototype.hasOwnProperty.call(incoming, "cursorStateDbPath")) {
+      merged.cursorStateDbPath = String(incoming.cursorStateDbPath || "").trim();
+    } else {
+      merged.cursorStateDbPath = String(current.cursorStateDbPath || "").trim();
+    }
     writeJSON(settingsPath, merged);
     quotaCache.clear();
+    cursorUsageCollector = null;
     return merged;
   }
 
@@ -1325,10 +1571,10 @@ function createDashboardServer({ userDataPath }) {
   async function fetchOAuthQuotaCached(rawAuth, normalizedAuth, settings, forceRefresh = false) {
     const sourceProvider = sourceProviderKey(normalizedAuth);
     const authIndex = normalizedAuth.authIndex;
-    if (authIndex == null || String(normalizedAuth.accountType || "").toLowerCase() === "api-key") {
+    if (authIndex == null || isApiKeyAccountType(normalizedAuth.accountType)) {
       return null;
     }
-    const indexedOAuth = String(normalizedAuth.accountType || "").toLowerCase() === "oauth" && authIndex != null;
+    const indexedOAuth = isOAuthAccountType(normalizedAuth.accountType) && authIndex != null;
     if (normalizedAuth.hasAccount === false && !indexedOAuth) {
       return null;
     }
@@ -1343,11 +1589,23 @@ function createDashboardServer({ userDataPath }) {
     let value = null;
     if (sourceProvider.includes("claude") || sourceProvider.includes("anthropic") || normalizedAuth.provider === "anthropic") {
       value = await fetchClaudeQuota(rawAuth, normalizedAuth, settings, fetchManagement);
-    } else if (sourceProvider.includes("codex") || sourceProvider.includes("openai") || normalizedAuth.provider === "openai") {
+    } else if (sourceProvider.includes("codex") || sourceProvider.includes("openai") || sourceProvider.includes("chatgpt") || normalizedAuth.provider === "openai") {
       value = await fetchCodexQuota(rawAuth, normalizedAuth, settings, fetchManagement);
     } else if (sourceProvider.includes("xai") || sourceProvider.includes("grok") || normalizedAuth.provider === "xai") {
       value = await fetchXaiQuota(rawAuth, normalizedAuth, settings, fetchManagement);
-    } else if (sourceProvider.includes("antigravity") || sourceProvider.includes("google") || sourceProvider.includes("gemini") || normalizedAuth.provider === "google") {
+    } else if (sourceProvider.includes("kimi") || sourceProvider.includes("moonshot") || normalizedAuth.provider === "kimi") {
+      value = await fetchKimiQuota(rawAuth, normalizedAuth, settings, fetchManagement);
+    } else if (sourceProvider.includes("cursor") || normalizedAuth.provider === "cursor") {
+      value = await fetchCursorQuota(rawAuth, normalizedAuth, settings, fetchManagement);
+    } else if (sourceProvider.includes("vertex")) {
+      // Vertex credentials have no CPA-proxied OAuth quota endpoint yet.
+      value = null;
+    } else if (
+      sourceProvider.includes("antigravity")
+      || sourceProvider.includes("gemini")
+      || sourceProvider.includes("google")
+      || normalizedAuth.provider === "google"
+    ) {
       value = await fetchAntigravityQuota(rawAuth, normalizedAuth, settings, fetchManagement);
     }
 
@@ -1414,20 +1672,29 @@ function createDashboardServer({ userDataPath }) {
       anthropic: "https://status.claude.com/api/v2/summary.json"
     };
 
-    const settled = await Promise.allSettled(
-      Object.entries(endpoints).map(async ([provider, url]) => [provider, normalizeStatuspage(provider, await fetchJSON(url), url)])
+    const settled = await Promise.all(
+      Object.entries(endpoints).map(async ([provider, url]) => {
+        try {
+          return {
+            provider,
+            ok: true,
+            value: normalizeStatuspage(provider, await fetchJSON(url), url)
+          };
+        } catch (error) {
+          return {
+            provider,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error)
+          };
+        }
+      })
     );
     const statuses = {};
     const errors = {};
 
     for (const item of settled) {
-      if (item.status === "fulfilled") {
-        const [provider, value] = item.value;
-        statuses[provider] = value;
-      } else {
-        const provider = Object.keys(endpoints)[settled.indexOf(item)] || "unknown";
-        errors[provider] = item.reason instanceof Error ? item.reason.message : String(item.reason);
-      }
+      if (item.ok) statuses[item.provider] = item.value;
+      else errors[item.provider] = item.error;
     }
 
     statusCache = {
@@ -1452,6 +1719,7 @@ function createDashboardServer({ userDataPath }) {
       usageStatisticsEnabled: null,
       providerStatus: cachedStatus.statuses || {},
       providerStatusErrors: cachedStatus.errors || {},
+      cursorUsage: null,
       ...overrides
     };
   }
@@ -1476,24 +1744,34 @@ function createDashboardServer({ userDataPath }) {
       }
     }
 
-    const statusSnapshot = await fetchProviderStatus().catch((error) => ({
-      statuses: {},
-      errors: { status: error instanceof Error ? error.message : String(error) },
-      fetchedAt: new Date().toISOString()
-    }));
     const result = emptySnapshot({
       lastUpdated: startedAt,
       error: drainError ? (drainError instanceof Error ? drainError.message : String(drainError)) : null,
       queueAdded: drainResult.added,
-      usageEvents: readUsageEvents(),
-      providerStatus: statusSnapshot.statuses,
-      providerStatusErrors: statusSnapshot.errors
+      usageEvents: readUsageEvents()
     });
+
+    if (settings.cursorUsageEnabled !== false) {
+      // Prefer local JWT first so Overview has something before CPA auth-files finish;
+      // overwritten below when CPA has cursor OAuth accounts with quota.
+      result.cursorUsage = await getCursorCollector().collect({ force: forceQuotaRefresh });
+    } else {
+      result.cursorUsage = { ok: false, disabled: true, fetchedAt: new Date().toISOString() };
+    }
 
     if (!settings.managementKey) {
       result.error = "Management key is not configured.";
       return rememberSnapshot(result);
     }
+
+    // Fetch official status only after we know CPA is configured; avoids blocking first paint on demo/unconfigured starts.
+    const statusSnapshot = await fetchProviderStatus().catch((error) => ({
+      statuses: {},
+      errors: { status: error instanceof Error ? error.message : String(error) },
+      fetchedAt: new Date().toISOString()
+    }));
+    result.providerStatus = statusSnapshot.statuses;
+    result.providerStatusErrors = statusSnapshot.errors;
 
     try {
       const [authFilesPayload, enabledPayload, apiKeyUsagePayload] = await Promise.allSettled([
@@ -1504,6 +1782,28 @@ function createDashboardServer({ userDataPath }) {
 
       if (authFilesPayload.status === "fulfilled") {
         result.authFiles = await enrichAuthFilesWithQuota(extractArray(authFilesPayload.value), settings, forceQuotaRefresh);
+        if (settings.cursorUsageEnabled !== false) {
+          const cpaCursor = result.authFiles.find((auth) => (
+            auth?.provider === "cursor"
+            && auth?.quota?.cursorUsage
+            && auth.quota.cursorUsage.ok
+          ));
+          if (cpaCursor?.quota?.cursorUsage) {
+            const localMembership = result.cursorUsage?.membershipType;
+            const cpaMembership = cpaCursor.quota.cursorUsage.membershipType;
+            result.cursorUsage = {
+              ...cpaCursor.quota.cursorUsage,
+              source: "cpa",
+              membershipType: cpaMembership && cpaMembership !== "unknown"
+                ? cpaMembership
+                : (localMembership || cpaMembership || "unknown"),
+              email: cpaCursor.quota.cursorUsage.email || cpaCursor.email || cpaCursor.account || cpaCursor.label || ""
+            };
+            if ((!cpaCursor.quota.plan || cpaCursor.quota.plan === "unknown") && result.cursorUsage.membershipType) {
+              cpaCursor.quota.plan = result.cursorUsage.membershipType;
+            }
+          }
+        }
       }
 
       if (enabledPayload.status === "fulfilled") {
@@ -1614,9 +1914,15 @@ module.exports = {
     antigravityWindows,
     atomicWriteFile,
     boundedInteger,
+    isApiKeyAccountType,
+    isOAuthAccountType,
     normalizeAuthFile,
+    normalizeProvider,
     normalizeUsageRecord,
     parseClaudeQuotaUsage,
+    parseKimiQuotaUsage,
+    cursorQuotaFromUsage,
+    kimiMembershipLabel,
     ratioToPercent
   }
 };

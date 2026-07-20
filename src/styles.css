@@ -366,6 +366,115 @@ button { color: inherit; }
   line-height: 1.45;
 }
 
+.cursor-card .cursor-remaining {
+  display: grid;
+  gap: 8px;
+  padding: 2px 12px 10px;
+}
+.cursor-card .cursor-remaining > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+.cursor-card .cursor-remaining span {
+  color: var(--muted-soft);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.cursor-card .cursor-remaining strong {
+  font-size: 28px;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+}
+.cursor-card .cursor-remaining small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.cursor-card.good .cursor-remaining strong { color: var(--good); }
+.cursor-card.warn .cursor-remaining strong { color: var(--warn); }
+.cursor-card.bad .cursor-remaining strong { color: var(--bad); }
+.cursor-meter {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+  contain: content;
+}
+.cursor-meter i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #19c37d, #6aa9ff);
+  transition: width 0.45s ease;
+}
+.cursor-card.bad .cursor-meter i { background: linear-gradient(90deg, #fb7185, #fbbf24); }
+.cursor-pools {
+  display: grid;
+  gap: 10px;
+  padding: 0 12px 12px;
+}
+.cursor-pool {
+  display: grid;
+  gap: 6px;
+}
+.cursor-pool-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cursor-pool-head > div {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.cursor-pool-head strong {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.cursor-pool-head small {
+  color: var(--muted-soft);
+  font-size: 10px;
+}
+.cursor-pool-head > span {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.cursor-pool.good .cursor-meter i { background: linear-gradient(90deg, #19c37d, #34d399); }
+.cursor-pool.warn .cursor-meter i { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+.cursor-pool.bad .cursor-meter i { background: linear-gradient(90deg, #fb7185, #f43f5e); }
+.cursor-pool p,
+.cursor-messages p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.cursor-messages {
+  padding: 0 12px 12px;
+  display: grid;
+  gap: 4px;
+}
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.checkbox-field input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+.field-hint {
+  margin: -4px 12px 12px;
+  color: var(--muted-soft);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 /* ---------- metrics ---------- */
 .metrics-grid {
   display: grid;

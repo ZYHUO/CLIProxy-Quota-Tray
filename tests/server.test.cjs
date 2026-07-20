@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const {
   createDashboardServer,
+  normalizeManagementBaseUrl,
   __test
 } = require("../electron/server.cjs");
 
@@ -33,6 +34,155 @@ async function withDashboardServer(run) {
     fs.rmSync(userDataPath, { recursive: true, force: true });
   }
 }
+
+test("Cursor usage normalizer converts cents plan remaining correctly", { concurrency: false }, () => {
+  const { normalizeCursorUsage } = require("../electron/cursor-usage.cjs");
+  const normalized = normalizeCursorUsage({
+    billingCycleStart: "1782657380000",
+    billingCycleEnd: "1785249380000",
+    displayMessage: "hit limit",
+    planUsage: {
+      totalSpend: 9597,
+      includedSpend: 2000,
+      bonusSpend: 7597,
+      limit: 2000,
+      autoPercentUsed: 22,
+      apiPercentUsed: 65
+    }
+  }, { email: "a@b.c", membershipType: "pro" });
+
+  assert.equal(normalized.ok, true);
+  assert.equal(normalized.membershipType, "pro");
+  assert.equal(normalized.plan.limitUsd, 20);
+  assert.equal(normalized.plan.includedSpendUsd, 20);
+  assert.equal(normalized.plan.remainingUsd, 0);
+  assert.equal(normalized.plan.remainingPercent, 0);
+  assert.equal(normalized.plan.bonusSpendUsd, 75.97);
+});
+
+test("management base URL normalizes host-only and /v0 inputs without doubling", { concurrency: false }, () => {
+  assert.equal(
+    normalizeManagementBaseUrl({ baseUrl: "127.0.0.1:8317" }),
+    "http://127.0.0.1:8317/v0/management"
+  );
+  assert.equal(
+    normalizeManagementBaseUrl({ baseUrl: "http://127.0.0.1:8317/v0" }),
+    "http://127.0.0.1:8317/v0/management"
+  );
+  assert.equal(
+    normalizeManagementBaseUrl({ baseUrl: "http://127.0.0.1:8317/v0/management" }),
+    "http://127.0.0.1:8317/v0/management"
+  );
+  assert.equal(
+    normalizeManagementBaseUrl({ baseUrl: "http://127.0.0.1:8317/management" }),
+    "http://127.0.0.1:8317/management"
+  );
+});
+
+test("CPA provider keys map to tray buckets and kimi stays visible", { concurrency: false }, () => {
+  assert.equal(__test.normalizeProvider("codex"), "openai");
+  assert.equal(__test.normalizeProvider("claude"), "anthropic");
+  assert.equal(__test.normalizeProvider("antigravity"), "google");
+  assert.equal(__test.normalizeProvider("xai"), "xai");
+  assert.equal(__test.normalizeProvider("kimi"), "kimi");
+  assert.equal(__test.normalizeProvider("moonshot"), "kimi");
+  assert.equal(__test.normalizeProvider("cursor"), "cursor");
+  assert.equal(__test.normalizeProvider("cursor-oauth"), "cursor");
+  assert.equal(__test.normalizeProvider("vertex"), "google");
+  assert.equal(__test.normalizeProvider("gemini-cli"), "google");
+});
+
+test("auth-files type is the provider key and must not become accountType", { concurrency: false }, () => {
+  const auth = __test.normalizeAuthFile({
+    type: "kimi",
+    provider: "kimi",
+    account_type: "oauth",
+    auth_index: 12,
+    label: "Kimi User"
+  });
+
+  assert.equal(auth.provider, "kimi");
+  assert.equal(auth.sourceProvider, "kimi");
+  assert.equal(auth.accountType, "oauth");
+  assert.equal(auth.hasAccount, true);
+  assert.equal(auth.authIndex, 12);
+
+  const cursor = __test.normalizeAuthFile({
+    type: "cursor",
+    provider: "cursor",
+    account_type: "oauth",
+    auth_index: "cur-1",
+    label: "Cursor Pro"
+  });
+  assert.equal(cursor.provider, "cursor");
+  assert.equal(cursor.sourceProvider, "cursor");
+  assert.equal(cursor.accountType, "oauth");
+});
+
+test("missing account_type still defaults to oauth instead of copying provider type", { concurrency: false }, () => {
+  const auth = __test.normalizeAuthFile({
+    type: "kimi",
+    provider: "kimi",
+    auth_index: 9,
+    name: "kimi-123.json"
+  });
+
+  assert.equal(auth.accountType, "oauth");
+  assert.equal(auth.provider, "kimi");
+  assert.equal(__test.isApiKeyAccountType("api_key"), true);
+  assert.equal(__test.isApiKeyAccountType("api-key"), true);
+  assert.equal(__test.isApiKeyAccountType("oauth"), false);
+  assert.equal(__test.isOAuthAccountType("oauth"), true);
+});
+
+test("Kimi usages parser maps weekly membership and 5h rate limit", { concurrency: false }, () => {
+  const parsed = __test.parseKimiQuotaUsage({
+    user: { membership: { level: "LEVEL_INTERMEDIATE" } },
+    usage: {
+      limit: "100",
+      used: "24",
+      remaining: "76",
+      resetTime: "2026-07-23T13:53:17.077157Z"
+    },
+    limits: [{
+      window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
+      detail: {
+        limit: "100",
+        remaining: "100",
+        resetTime: "2026-07-20T17:53:17.077157Z"
+      }
+    }]
+  });
+
+  assert.equal(parsed.plan, "Moderato");
+  assert.deepEqual(
+    parsed.windows.map((window) => [window.id, window.remainingPercent, window.remaining]),
+    [
+      ["weekly", 76, 76],
+      ["five_hour", 100, 100]
+    ]
+  );
+});
+
+test("Cursor CPA quota mapper exposes included remaining window", { concurrency: false }, () => {
+  const { normalizeCursorUsage } = require("../electron/cursor-usage.cjs");
+  const normalized = normalizeCursorUsage({
+    billingCycleEnd: "1785249380000",
+    planUsage: {
+      includedSpend: 500,
+      limit: 2000,
+      autoPercentUsed: 10,
+      apiPercentUsed: 20
+    }
+  }, { email: "a@b.c", membershipType: "pro" });
+  const quota = __test.cursorQuotaFromUsage(normalized);
+  assert.equal(quota.provider, "cursor");
+  assert.equal(quota.plan, "pro");
+  assert.equal(quota.windows[0].id, "monthly");
+  assert.equal(quota.windows[0].remainingPercent, 75);
+  assert.equal(quota.groups.length, 2);
+  assert.equal(quota.cursorUsage.ok, true);
+});
 
 test("Antigravity remainingFraction is converted to percent exactly once", { concurrency: false }, () => {
   const windows = __test.antigravityWindows({

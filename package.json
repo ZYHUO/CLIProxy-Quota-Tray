@@ -2,7 +2,7 @@
   "name": "cliproxy-quota-tray",
   "productName": "CLIProxy Quota Tray",
   "version": "1.0.1",
-  "description": "Windows tray dashboard for CLIProxyAPI OAuth quota, usage cost and provider status",
+  "description": "System tray dashboard for CLIProxyAPI OAuth quota, usage cost and provider status (Windows + Linux)",
   "engines": {
     "node": ">=22.12.0"
   },
@@ -16,7 +16,9 @@
     "test": "node --test tests/*.test.cjs",
     "electron": "vite build && electron . --dist",
     "preview:fake": "vite build && node scripts/serve-preview.mjs",
-    "package:win": "vite build && electron-packager . \"CLIProxy Quota Tray\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/(src|tools|docs|scripts|tests|release|node_modules|\\.git|\\.github)($|/)\" --ignore=\"^/(vite\\.config\\.js|index\\.html|\\.gitignore|README\\.md|AGENT\\.md)$\""
+    "package:win": "vite build && electron-packager . \"CLIProxy Quota Tray\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/(src|tools|docs|scripts|tests|release|node_modules|\\.git|\\.github)($|/)\" --ignore=\"^/(vite\\.config\\.js|index\\.html|\\.gitignore|README\\.md|AGENT\\.md)$\"",
+    "package:linux": "vite build && electron-packager . \"CLIProxy Quota Tray\" --platform=linux --arch=x64 --out=release --overwrite --ignore=\"^/(src|tools|docs|scripts|tests|release|node_modules|\\.git|\\.github)($|/)\" --ignore=\"^/(vite\\.config\\.js|index\\.html|\\.gitignore|README\\.md|AGENT\\.md)$\"",
+    "install:linux": "bash scripts/install-linux.sh"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
