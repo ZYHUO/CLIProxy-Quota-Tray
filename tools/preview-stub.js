@@ -10,25 +10,25 @@
 
         const authFiles = [
           {
-            id: "oa-1", authIndex: 1, name: "codex-main.oauth.json", provider: "openai",
+            id: "oa-1", authIndex: 1, name: "codex-main.oauth.json", provider: "codex",
             email: "codex-main@team.dev", status: "up", accountType: "oauth",
             success: 1841, failed: 23, path: "auths/codex-main.oauth.json",
             quota: { plan: "Pro", windows: [win("five_hour", 68, 2.4), win("weekly", 81, 96)] }
           },
           {
-            id: "oa-2", authIndex: 2, name: "codex-alt.oauth.json", provider: "openai",
+            id: "oa-2", authIndex: 2, name: "codex-alt.oauth.json", provider: "codex",
             email: "codex-alt@team.dev", status: "degraded", accountType: "oauth",
             success: 402, failed: 61, path: "auths/codex-alt.oauth.json",
             quota: { plan: "Plus", windows: [win("five_hour", 21, 1.1), win("weekly", 34, 52)] }
           },
           {
-            id: "oa-3", authIndex: 7, name: "codex-eu.oauth.json", provider: "openai",
+            id: "oa-3", authIndex: 7, name: "codex-eu.oauth.json", provider: "codex",
             email: "codex-eu@team.dev", status: "up", accountType: "oauth",
             success: 12, failed: 30, path: "auths/codex-eu.oauth.json",
             quota: { error: "/api-call: request timed out after 15s" }
           },
           {
-            id: "an-1", authIndex: 3, name: "claude-max.oauth.json", provider: "anthropic",
+            id: "an-1", authIndex: 3, name: "claude-max.oauth.json", provider: "claude",
             email: "claude-max@team.dev", status: "up", accountType: "oauth",
             success: 3210, failed: 12, path: "auths/claude-max.oauth.json",
             quota: {
@@ -40,13 +40,13 @@
             }
           },
           {
-            id: "an-2", authIndex: 4, name: "claude-fable.oauth.json", provider: "anthropic",
+            id: "an-2", authIndex: 4, name: "claude-fable.oauth.json", provider: "claude",
             email: "fable@team.dev", status: "up", accountType: "oauth",
             success: 980, failed: 4, path: "auths/claude-fable.oauth.json",
             quota: { plan: "Pro", windows: [win("five_hour", 92, 4.6), win("weekly", 88, 140)] }
           },
           {
-            id: "gg-1", authIndex: 5, name: "antigravity.oauth.json", provider: "google",
+            id: "gg-1", authIndex: 5, name: "antigravity.oauth.json", provider: "antigravity",
             email: "antigravity@team.dev", status: "up", accountType: "oauth",
             success: 5120, failed: 38, path: "auths/antigravity.oauth.json",
             quota: { plan: "AI Pro", windows: [win("five_hour", 57, 1.8), win("weekly", 76, 88)] }
@@ -56,6 +56,24 @@
             email: "grok-build@team.dev", status: "up", accountType: "oauth",
             success: 640, failed: 9, path: "auths/grok-build.oauth.json",
             quota: { plan: "SuperGrok", windows: [win("weekly", 91, 70), win("monthly", 76, 430)] }
+          },
+          {
+            id: "km-1", authIndex: 8, name: "kimi-main.oauth.json", provider: "kimi",
+            label: "Kimi User", status: "up", accountType: "oauth",
+            success: 210, failed: 3, path: "auths/kimi-main.oauth.json",
+            quota: { plan: "Moderato", windows: [win("five_hour", 100, 4), win("weekly", 76, 68)] }
+          },
+          {
+            id: "cu-1", authIndex: 10, name: "cursor.json", provider: "cursor",
+            label: "Cursor Pro", status: "up", accountType: "oauth",
+            success: 120, failed: 1, path: "auths/cursor.json",
+            quota: { plan: "pro", windows: [win("monthly", 35, 400)] }
+          },
+          {
+            id: "vx-1", authIndex: 9, name: "vertex-proj.json", provider: "vertex",
+            email: "vertex@team.dev", status: "up", accountType: "oauth",
+            success: 88, failed: 1, path: "auths/vertex-proj.json",
+            quota: { windows: [] }
           }
         ];
 
@@ -63,13 +81,15 @@
           openai: ["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex"],
           anthropic: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-fable-5"],
           google: ["gemini-3.1-pro", "gemini-3-flash"],
-          xai: ["grok-4.5", "grok-code"]
+          xai: ["grok-4.5", "grok-code"],
+          kimi: ["kimi-k2.5", "kimi-k2"],
+          cursor: ["cursor-composer", "gpt-5.3-codex"]
         };
         const authsByProvider = {
           openai: ["oa-1", "oa-2"], anthropic: ["an-1", "an-2"],
-          google: ["gg-1"], xai: ["xa-1"]
+          google: ["gg-1", "vx-1"], xai: ["xa-1"], kimi: ["km-1"], cursor: ["cu-1"]
         };
-        const providers = ["openai", "anthropic", "google", "xai"];
+        const providers = ["openai", "anthropic", "google", "xai", "kimi"];
         const usageEvents = [];
         let n = 0;
         for (let day = 29; day >= 0; day--) {

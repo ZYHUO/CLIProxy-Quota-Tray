@@ -10,6 +10,8 @@ import {
   Grid2x2,
   KeyRound,
   LoaderCircle,
+  Moon,
+  MousePointer2,
   Pin,
   PinOff,
   RefreshCw,
@@ -46,7 +48,7 @@ const PROVIDER_META = {
   },
   google: {
     name: "Gemini",
-    vendor: "Google",
+    vendor: "Antigravity / Vertex",
     service: "Google",
     plan: "",
     icon: Sparkles,
@@ -61,6 +63,26 @@ const PROVIDER_META = {
     plan: "",
     icon: Zap,
     accent: "#d7dce5",
+    low: "#fb7185",
+    warn: "#fbbf24"
+  },
+  kimi: {
+    name: "Kimi",
+    vendor: "Moonshot",
+    service: "Kimi",
+    plan: "",
+    icon: Moon,
+    accent: "#7dd3fc",
+    low: "#fb7185",
+    warn: "#fbbf24"
+  },
+  cursor: {
+    name: "Cursor",
+    vendor: "Cursor",
+    service: "Cursor",
+    plan: "",
+    icon: MousePointer2,
+    accent: "#94a3b8",
     low: "#fb7185",
     warn: "#fbbf24"
   },
@@ -81,10 +103,12 @@ const DEFAULT_QUOTAS = {
   anthropic: { fiveHourTokens: 32e7, weeklyTokens: 25e8, costPerMTok: 9, label: "" },
   google: { fiveHourTokens: 8e8, weeklyTokens: 5e9, costPerMTok: 1.5, label: "" },
   xai: { fiveHourTokens: 25e7, weeklyTokens: 18e8, costPerMTok: 4, label: "" },
+  kimi: { fiveHourTokens: 2e8, weeklyTokens: 15e8, costPerMTok: 2.5, label: "" },
+  cursor: { fiveHourTokens: 1e8, weeklyTokens: 7e8, costPerMTok: 5, label: "" },
   misc: { fiveHourTokens: 1e8, weeklyTokens: 7e8, costPerMTok: 3, label: "" }
 };
 
-const PROVIDER_ORDER = ["openai", "anthropic", "google", "xai", "misc"];
+const PROVIDER_ORDER = ["openai", "anthropic", "google", "xai", "kimi", "cursor", "misc"];
 
 // Plan strings that must never be shown (do not infer premium plans).
 const HIDDEN_PLAN_LABELS = new Set(["google ai ultra", "supergrok heavy", "custom"]);
@@ -92,7 +116,7 @@ const HIDDEN_PLAN_LABELS = new Set(["google ai ultra", "supergrok heavy", "custo
 const WINDOW_SYNONYMS = {
   five_hour: ["five_hour", "five-hour", "5h", "5 hours", "five hours", "primary"],
   weekly: ["weekly", "week", "seven_day", "seven-day", "7d", "7 days", "secondary"],
-  monthly: ["monthly", "month", "monthly_credits", "monthly credits", "billing month", "30d", "30 days"],
+  monthly: ["monthly", "month", "monthly_credits", "monthly credits", "billing month", "30d", "30 days", "included", "period"],
   daily: ["daily", "day", "24h", "24 hours"]
 };
 
@@ -109,15 +133,24 @@ function providerBadge(provider) {
 
 function normalizeProvider(value = "") {
   const raw = String(value || "").toLowerCase();
-  return raw.includes("openai") || raw.includes("chatgpt") || raw.includes("codex")
-    ? "openai"
-    : raw.includes("anthropic") || raw.includes("claude")
-      ? "anthropic"
-      : raw.includes("google") || raw.includes("gemini") || raw.includes("antigravity")
-        ? "google"
-        : raw.includes("grok") || raw.includes("xai") || raw.includes("x.ai")
-          ? "xai"
-          : "misc";
+  // Match CLIProxyAPI auth-files provider keys: codex, claude, antigravity, xai, kimi, cursor, vertex, gemini(-cli).
+  if (raw.includes("openai") || raw.includes("chatgpt") || raw.includes("codex")) return "openai";
+  if (raw.includes("anthropic") || raw.includes("claude")) return "anthropic";
+  if (raw.includes("kimi") || raw.includes("moonshot")) return "kimi";
+  if (raw.includes("cursor")) return "cursor";
+  if (raw.includes("grok") || raw.includes("xai") || raw.includes("x.ai")) return "xai";
+  if (
+    raw.includes("google")
+    || raw.includes("gemini")
+    || raw.includes("antigravity")
+    || raw.includes("vertex")
+  ) return "google";
+  return "misc";
+}
+
+function isApiKeyAccountType(value) {
+  const raw = String(value || "").toLowerCase().replace(/[_-]/g, "");
+  return raw === "apikey";
 }
 
 function isInsecureRemoteManagementUrl(value) {
@@ -149,12 +182,13 @@ function toNumber(value, fallback = 0) {
 
 function demoUsageEvents() {
   const now = Date.now();
-  const providers = ["openai", "anthropic", "google", "xai", "openai", "anthropic", "google"];
+  const providers = ["openai", "anthropic", "google", "xai", "kimi", "openai", "anthropic"];
   const models = {
     openai: ["gpt-5", "gpt-5.3-codex-spark", "gpt-oss-120b"],
     anthropic: ["Claude Sonnet 4.6", "Claude Opus 4.6", "Claude Code"],
     google: ["Gemini 3.5 Flash", "Gemini 3.1 Pro", "AntiGravity"],
     xai: ["Grok", "Grok Code"],
+    kimi: ["kimi-k2.5", "kimi-k2"],
     misc: ["router-default"]
   };
   return Array.from({ length: 420 }, (_, index) => {
@@ -180,16 +214,18 @@ function demoUsageEvents() {
 
 function demoAuthFiles() {
   return [
-    { name: "chatgpt-main.oauth.json", provider: "openai", status: "degraded", email: "codex workspace" },
-    { name: "claude-code-max.oauth.json", provider: "anthropic", status: "degraded", email: "claude tag account" },
-    { name: "gemini-main.oauth.json", provider: "google", status: "up", email: "google ai" },
-    { name: "grok-main.oauth.json", provider: "xai", status: "up", email: "xai build" },
-    { name: "claude-fable.oauth.json", provider: "anthropic", status: "up", email: "fable" },
-    { name: "antigravity.oauth.json", provider: "google", status: "up", email: "antigravity" }
+    { name: "codex-main.oauth.json", provider: "codex", accountType: "oauth", authIndex: 1, status: "degraded", email: "codex workspace" },
+    { name: "claude-code-max.oauth.json", provider: "claude", accountType: "oauth", authIndex: 2, status: "degraded", email: "claude tag account" },
+    { name: "antigravity.oauth.json", provider: "antigravity", accountType: "oauth", authIndex: 3, status: "up", email: "antigravity" },
+    { name: "grok-main.oauth.json", provider: "xai", accountType: "oauth", authIndex: 4, status: "up", email: "xai build" },
+    { name: "kimi-main.oauth.json", provider: "kimi", accountType: "oauth", authIndex: 5, status: "up", label: "Kimi User" },
+    { name: "vertex-proj.json", provider: "vertex", accountType: "oauth", authIndex: 6, status: "up", email: "vertex sa" },
+    { name: "claude-fable.oauth.json", provider: "claude", accountType: "oauth", authIndex: 7, status: "up", email: "fable" }
   ];
 }
 
 function demoSnapshot() {
+  const now = Date.now();
   return {
     connected: false,
     demo: true,
@@ -201,12 +237,37 @@ function demoSnapshot() {
       managementKey: "",
       pollIntervalSec: 1200,
       usageQueueBatchSize: 200,
+      cursorUsageEnabled: true,
       quotas: DEFAULT_QUOTAS
     },
     authFiles: demoAuthFiles(),
     apiKeyUsage: [],
     usageEvents: demoUsageEvents(),
     usageStatisticsEnabled: true,
+    cursorUsage: {
+      ok: true,
+      membershipType: "pro",
+      email: "you@example.com",
+      billingCycleStart: new Date(now - 10 * DAY_MS).toISOString(),
+      billingCycleEnd: new Date(now + 20 * DAY_MS).toISOString(),
+      displayMessage: "Demo Cursor usage",
+      autoMessage: "You've used 28% of your included total usage",
+      apiMessage: "You've used 65% of your included API usage",
+      plan: {
+        limitUsd: 20,
+        includedSpendUsd: 13,
+        bonusSpendUsd: 4.2,
+        totalSpendUsd: 17.2,
+        remainingUsd: 7,
+        remainingPercent: 35,
+        usedPercent: 65,
+        autoPercentUsed: 22,
+        apiPercentUsed: 65,
+        remainingBonus: true
+      },
+      onDemand: { limitType: "user" },
+      fetchedAt: new Date().toISOString()
+    },
     providerStatus: {
       openai: {
         provider: "openai",
@@ -284,13 +345,15 @@ function normalizeAuth(auth) {
   const hasAccount =
     auth.hasAccount ??
     !!(auth.account || auth.email || auth.label || auth.raw?.account || auth.raw?.email);
+  // CPA puts the provider key in `type`; account_type is the credential kind (oauth / api_key).
+  const accountType = auth.accountType || auth.account_type || "oauth";
   return {
     provider,
     name: authName(auth),
     id: String(auth.id || auth.authIndex || auth.auth_index || authName(auth)),
     authIndex: auth.authIndex ?? auth.auth_index ?? auth.index ?? null,
     sourceProvider: auth.sourceProvider || auth.provider || "",
-    accountType: auth.accountType || auth.account_type || "oauth",
+    accountType,
     hasAccount,
     status: down ? "down" : degraded ? "degraded" : "up",
     success: toNumber(auth.success),
@@ -397,6 +460,10 @@ function fallbackWindows(providerKey) {
           { id: "weekly", label: "week limit" },
           { id: "monthly", label: "month limit" }
         ]
+      : providerKey === "cursor"
+        ? [
+            { id: "monthly", label: "included limit" }
+          ]
       : [
           { id: "five_hour", label: "5h limit" },
           { id: "weekly", label: "week limit" }
@@ -518,7 +585,7 @@ function buildDashboard(snapshot) {
     .filter((event) => Number.isFinite(event.createdAtMs) && event.createdAtMs <= now);
   const auths = (snapshot.authFiles || [])
     .map(normalizeAuth)
-    .filter((auth) => String(auth.accountType || "").toLowerCase() !== "api-key");
+    .filter((auth) => !isApiKeyAccountType(auth.accountType));
   const apiKeys = (snapshot.apiKeyUsage || []).map(normalizeApiKey);
   const todayStart = new Date(now);
   todayStart.setHours(0, 0, 0, 0);
@@ -691,7 +758,8 @@ function mergeSnapshot(previous, next) {
       typeof next.usageStatisticsEnabled == "boolean"
         ? next.usageStatisticsEnabled
         : previous.usageStatisticsEnabled,
-    providerStatus: next.providerStatus || previous.providerStatus
+    providerStatus: next.providerStatus || previous.providerStatus,
+    cursorUsage: next.cursorUsage || previous.cursorUsage || null
   };
 }
 
@@ -1194,6 +1262,117 @@ function CostCard({ dashboard }) {
   );
 }
 
+function formatUsd(value) {
+  if (!Number.isFinite(Number(value))) return "--";
+  return formatMoney(Number(value));
+}
+
+function CursorUsageCard({ cursorUsage }) {
+  if (!cursorUsage) return null;
+  if (cursorUsage.disabled) {
+    return (
+      <Card className="cursor-card">
+        <CardHeader icon={MousePointer2} title="Cursor" subtitle="Subscription usage" />
+        <div className="inline-warning">Cursor usage polling is disabled in Settings.</div>
+      </Card>
+    );
+  }
+  if (!cursorUsage.ok) {
+    return (
+      <Card className="cursor-card">
+        <CardHeader icon={MousePointer2} title="Cursor" subtitle="Subscription usage" />
+        <div className="quota-error" title={cursorUsage.error || "unavailable"}>
+          {cursorUsage.error || "Unable to read Cursor usage"}
+        </div>
+      </Card>
+    );
+  }
+
+  const plan = cursorUsage.plan || {};
+  const remaining = plan.remainingPercent;
+  const autoUsed = plan.autoPercentUsed;
+  const apiUsed = plan.apiPercentUsed;
+  const autoLeft = autoUsed == null ? null : Math.max(0, Math.min(100, 100 - autoUsed));
+  const apiLeft = apiUsed == null ? null : Math.max(0, Math.min(100, 100 - apiUsed));
+  const tone = remaining == null ? "warn" : remaining <= 10 ? "bad" : remaining <= 25 ? "warn" : "good";
+  const cycleStart = cursorUsage.billingCycleStart ? new Date(cursorUsage.billingCycleStart) : null;
+  const cycleEnd = cursorUsage.billingCycleEnd ? new Date(cursorUsage.billingCycleEnd) : null;
+  const cycleLabel =
+    cycleStart && cycleEnd && Number.isFinite(cycleStart.getTime()) && Number.isFinite(cycleEnd.getTime())
+      ? `${cycleStart.getMonth() + 1}/${cycleStart.getDate()} → ${cycleEnd.getMonth() + 1}/${cycleEnd.getDate()}`
+      : "billing cycle";
+
+  return (
+    <Card className={`cursor-card ${tone}`}>
+      <CardHeader
+        icon={MousePointer2}
+        title="Cursor"
+        subtitle={`${String(cursorUsage.membershipType || "plan").toUpperCase()} · ${cycleLabel}${
+          cursorUsage.source === "cpa" ? " · CPA" : cursorUsage.source === "cursor-local-jwt" || !cursorUsage.source ? " · local" : ""
+        }`}
+        badge={cursorUsage.email || ""}
+      />
+      <div className="cursor-remaining">
+        <div>
+          <span>Included remaining</span>
+          <strong>{formatUsd(plan.remainingUsd)}</strong>
+          <small>
+            of {formatUsd(plan.limitUsd)} included
+            {remaining == null ? "" : ` · ${Math.round(remaining)}% left`}
+            {plan.bonusSpendUsd > 0 ? ` · bonus ${formatUsd(plan.bonusSpendUsd)}` : ""}
+          </small>
+        </div>
+        <div className="cursor-meter" aria-hidden="true">
+          <i style={{ width: `${Math.max(0, Math.min(100, remaining == null ? plan.usedPercent || 0 : 100 - remaining))}%` }} />
+        </div>
+      </div>
+      <div className="cursor-pools">
+        <CursorPoolBar
+          label="Auto / Composer"
+          hint="Auto + Composer share this pool"
+          usedPercent={autoUsed}
+          leftPercent={autoLeft}
+          message={cursorUsage.autoMessage}
+        />
+        <CursorPoolBar
+          label="API / named models"
+          hint="Explicit model picks"
+          usedPercent={apiUsed}
+          leftPercent={apiLeft}
+          message={cursorUsage.apiMessage}
+        />
+      </div>
+      {cursorUsage.displayMessage ? (
+        <div className="cursor-messages">
+          <p>{cursorUsage.displayMessage}</p>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function CursorPoolBar({ label, hint, usedPercent, leftPercent, message }) {
+  const missing = usedPercent == null && leftPercent == null;
+  const used = missing ? 0 : Math.max(0, Math.min(100, usedPercent == null ? 100 - leftPercent : usedPercent));
+  const left = leftPercent == null ? null : Math.round(leftPercent);
+  const tone = left == null ? "" : left <= 10 ? "bad" : left <= 25 ? "warn" : "good";
+  return (
+    <div className={`cursor-pool ${tone}`}>
+      <div className="cursor-pool-head">
+        <div>
+          <strong>{label}</strong>
+          {hint ? <small>{hint}</small> : null}
+        </div>
+        <span>{missing ? "--" : `${Math.round(used)}% used${left == null ? "" : ` · ${left}% left`}`}</span>
+      </div>
+      <div className="cursor-meter" aria-hidden="true">
+        <i style={{ width: `${used}%` }} />
+      </div>
+      {message ? <p>{message}</p> : null}
+    </div>
+  );
+}
+
 function HistoryCard({ dashboard }) {
   const max = Math.max(1, ...dashboard.history.map((entry) => entry.value));
   const average = dashboard.history.reduce((sum, entry) => sum + entry.value, 0) / dashboard.history.length;
@@ -1389,6 +1568,17 @@ function SettingsModal({ snapshot, onClose, onSaved, onEnabled, onClear }) {
             />
           </label>
         </div>
+        <label className="field checkbox-field">
+          <span>Show Cursor subscription usage</span>
+          <input
+            type="checkbox"
+            checked={draft.cursorUsageEnabled !== false}
+            onChange={(event) => setDraft({ ...draft, cursorUsageEnabled: event.target.checked })}
+          />
+        </label>
+        <p className="field-hint">
+          Reads the local Cursor login token and queries Cursor&apos;s unofficial usage API. Token never leaves this machine except to api2.cursor.sh.
+        </p>
         <div className="quota-table">
           <div className="quota-row head">
             <span>Provider</span>
@@ -1531,6 +1721,7 @@ export default function App() {
         ) : (
           <>
             <CostCard dashboard={dashboard} />
+            <CursorUsageCard cursorUsage={snapshot.cursorUsage} />
             <StatusCard
               providers={oauthProviders}
               expandedStatus={expandedStatus}
