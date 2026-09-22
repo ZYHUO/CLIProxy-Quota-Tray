@@ -1,0 +1,55 @@
+name: Bug report
+description: Something isn't behaving the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check that CLIProxyAPI itself is reachable first — the tray is a mirror, not a server.
+        Redact any token, password or real URL before posting logs.
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 10
+        - Windows 11
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Which stage breaks
+      options:
+        - Install / launch
+        - Connecting to CPA (shows disconnected)
+        - Quota missing or showing failure
+        - Cost statistics wrong
+        - Autostart
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tray version
+      placeholder: v1.0.1
+    validations:
+      required: true
+  - type: textarea
+    id: want
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: shell
