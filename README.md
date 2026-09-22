@@ -36,7 +36,7 @@
 
 #### 方式一：安装器（推荐）
 
-从 [Releases](../../releases) 下载 `CLIProxy-Quota-Tray-Setup-*.exe` 并运行：
+从 [Releases](https://github.com/ZYHUO/CLIProxy-Quota-Tray/releases) 下载 `CLIProxy-Quota-Tray-Setup-*.exe` 并运行：
 
 - 安装到 `%LOCALAPPDATA%\CLIProxy Quota Tray`（无需管理员权限）；
 - 自动结束正在运行的旧实例、创建开始菜单快捷方式，装完自动启动；
