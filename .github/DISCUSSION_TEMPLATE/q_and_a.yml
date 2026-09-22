@@ -1,0 +1,42 @@
+title: "Q&A"
+labels: ["q&a"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提问前先确认 CLIProxyAPI（CPA）本体已经能正常访问 Management API —— 托盘只是它的镜子。
+        贴配置前**删掉 token、密码和真实域名**。
+  - type: dropdown
+    id: os
+    attributes:
+      label: 系统
+      options:
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: 卡在哪一步
+      options:
+        - 安装 / 启动
+        - 连不上 CPA（显示未连接）
+        - 配额不显示或显示失败
+        - 成本统计不对
+        - 开机自启
+    validations:
+      required: true
+  - type: textarea
+    id: want
+    attributes:
+      label: 你期望看到什么
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际看到什么
+      description: 有截图更好；账号行上的失败原因也一并贴上
+    validations:
+      required: true
